@@ -492,6 +492,9 @@ void gv::GvProxySession::proxy_loop()
 
 void gv::GvProxySession::handle_step_end(void *request)
 {
+    // Flush trace output so it is available before the reply reaches the client
+    fflush(stdout);
+
     std::unique_lock<std::mutex> lock(this->proxy->mutex);
     dprintf(reply_fd, "req=%lld;msg=%ld\n", (long long)request,
         gv::Controller::get().top_get()->get_time_engine()->get_time());
