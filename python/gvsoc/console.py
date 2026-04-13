@@ -113,6 +113,7 @@ class GvsocConsole(cmd.Cmd):
         self.clock_domain = None  # Selected clock domain path
         self.clock_domains_cache = None  # Cached list of clock domains
         self.breakpoints = {}  # id -> {'addr': int}
+        self.watchpoints = {}  # id -> {'addr': int, 'size': int, 'type': 'write'|'read'}
         self.next_bp_id = 1
         self.iss_path = '**/chip/soc/fc/core'
         self.iss_ptr = None  # cached ISS component pointer
@@ -197,7 +198,7 @@ class GvsocConsole(cmd.Cmd):
         self._resume_if_halted()
         arg = arg.strip()
         if not arg:
-            if self.breakpoints:
+            if self.breakpoints or self.watchpoints:
                 # Step in small chunks until breakpoint hit or sim exits.
                 # Each chunk must complete before we can check breakpoint status
                 # (proxy locks the engine during component queries).
@@ -741,47 +742,78 @@ class GvsocConsole(cmd.Cmd):
         result = self.proxy._send_cmd(f'component {ptr} {cmd}')
         return result.strip() if result else None
 
+    def _is_halted(self):
+        """Check if the ISS is halted at a breakpoint or watchpoint."""
+        if self.breakpoints:
+            result = self._iss_cmd('breakpoint_status')
+            if result and 'hit=1' in result:
+                return True
+        if self.watchpoints:
+            result = self._iss_cmd('watchpoint_status')
+            if result and 'hit=1' in result:
+                return True
+        return False
+
     def _is_breakpoint_hit(self):
-        """Check if a breakpoint was hit (returns True/False without printing)."""
-        if not self.breakpoints:
-            return False
-        result = self._iss_cmd('breakpoint_status')
-        return result is not None and 'hit=1' in result
+        """Check if a breakpoint or watchpoint was hit."""
+        return self._is_halted()
 
     def _check_breakpoint_hit(self):
-        """Check if a breakpoint was hit and print a message."""
-        if not self.breakpoints:
-            return
-        result = self._iss_cmd('breakpoint_status')
-        if result and 'hit=1' in result:
-            # Parse address
-            addr = None
-            for part in result.split():
-                if part.startswith('addr='):
-                    addr = int(part.split('=')[1], 0)
-            # Find matching breakpoint
-            bp_id = None
-            if addr is not None:
-                for bid, bp in self.breakpoints.items():
-                    if bp['addr'] == addr:
-                        bp_id = bid
-                        break
-            if addr is not None:
-                sym = self._addr_to_symbol(addr)
-                loc = f"0x{addr:08X}"
-                if sym:
-                    loc += f" <{sym}>"
-                if bp_id is not None:
-                    print(f"Breakpoint {bp_id} hit at {loc}")
-                else:
-                    print(f"Breakpoint hit at {loc}")
+        """Check if a breakpoint or watchpoint was hit and print a message."""
+        if self.breakpoints:
+            result = self._iss_cmd('breakpoint_status')
+            if result and 'hit=1' in result:
+                addr = None
+                for part in result.split():
+                    if part.startswith('addr='):
+                        addr = int(part.split('=')[1], 0)
+                bp_id = None
+                if addr is not None:
+                    for bid, bp in self.breakpoints.items():
+                        if bp['addr'] == addr:
+                            bp_id = bid
+                            break
+                if addr is not None:
+                    sym = self._addr_to_symbol(addr)
+                    loc = f"0x{addr:08X}"
+                    if sym:
+                        loc += f" <{sym}>"
+                    if bp_id is not None:
+                        print(f"Breakpoint {bp_id} hit at {loc}")
+                    else:
+                        print(f"Breakpoint hit at {loc}")
+        if self.watchpoints:
+            result = self._iss_cmd('watchpoint_status')
+            if result and 'hit=1' in result:
+                addr = None
+                is_write = True
+                for part in result.split():
+                    if part.startswith('addr='):
+                        addr = int(part.split('=')[1], 0)
+                    elif part.startswith('is_write='):
+                        is_write = (part.split('=')[1] != '0')
+                kind = "Write" if is_write else "Read"
+                if addr is not None:
+                    sym = self._addr_to_symbol(addr)
+                    loc = f"0x{addr:08X}"
+                    if sym:
+                        loc += f" <{sym}>"
+                    # Find matching watchpoint
+                    wp_id = None
+                    for wid, wp in self.watchpoints.items():
+                        if wp['addr'] <= addr < wp['addr'] + wp['size']:
+                            wp_id = wid
+                            break
+                    if wp_id is not None:
+                        print(f"{kind} watchpoint {wp_id} hit at {loc}")
+                    else:
+                        print(f"{kind} watchpoint hit at {loc}")
 
     def _resume_if_halted(self):
-        """Resume the ISS if it is halted at a breakpoint."""
-        if not self.breakpoints:
+        """Resume the ISS if it is halted at a breakpoint or watchpoint."""
+        if not self.breakpoints and not self.watchpoints:
             return
-        result = self._iss_cmd('breakpoint_status')
-        if result and 'hit=1' in result:
+        if self._is_halted():
             self._iss_cmd('resume')
 
     def do_break(self, arg):
@@ -812,55 +844,120 @@ class GvsocConsole(cmd.Cmd):
         self.breakpoints[bp_id] = {'addr': addr}
         print(f"Breakpoint {bp_id} at 0x{addr:08X}")
 
-    def do_delete(self, arg):
-        """Delete breakpoint(s).
+    def _add_watchpoint(self, arg, wp_type):
+        """Add a watchpoint (write or read)."""
+        parts = arg.strip().split()
+        if not parts:
+            print(f"Usage: {'watch' if wp_type == 'write' else 'rwatch'} <address> [size]")
+            return
+
+        addr = self._resolve_addr(parts[0])
+        if addr is None:
+            print(f"Error: cannot resolve '{parts[0]}'")
+            return
+
+        size = 4  # default 4 bytes
+        if len(parts) >= 2:
+            try:
+                size = int(parts[1], 0)
+            except ValueError:
+                print(f"Error: invalid size '{parts[1]}'")
+                return
+
+        is_write = 1 if wp_type == 'write' else 0
+        result = self._iss_cmd(f'watchpoint_insert {is_write} 0x{addr:x} {size}')
+        if result is None:
+            return
+
+        wp_id = self.next_bp_id
+        self.next_bp_id += 1
+        self.watchpoints[wp_id] = {'addr': addr, 'size': size, 'type': wp_type}
+        kind = "Write" if wp_type == 'write' else "Read"
+        print(f"{kind} watchpoint {wp_id} at 0x{addr:08X} (size={size})")
+
+    def do_watch(self, arg):
+        """Set a write watchpoint.
 
         Usage:
-          delete 1      - delete breakpoint 1
-          delete        - delete all breakpoints
+          watch *0x1c000a00         - watch 4 bytes at address
+          watch 0x1c000a00 8        - watch 8 bytes at address
+          watch my_variable         - watch symbol (requires symbol load)
+
+        Stops when the watched address is written.
+        """
+        self._add_watchpoint(arg, 'write')
+
+    def do_rwatch(self, arg):
+        """Set a read watchpoint.
+
+        Usage:
+          rwatch *0x1c000a00        - watch 4 bytes at address
+          rwatch 0x1c000a00 8       - watch 8 bytes at address
+
+        Stops when the watched address is read.
+        """
+        self._add_watchpoint(arg, 'read')
+
+    def do_delete(self, arg):
+        """Delete breakpoint(s) or watchpoint(s).
+
+        Usage:
+          delete 1      - delete breakpoint/watchpoint 1
+          delete        - delete all breakpoints and watchpoints
         """
         if not arg:
-            # Delete all
             for bp_id, bp in list(self.breakpoints.items()):
                 self._iss_cmd(f'breakpoint_remove 0x{bp["addr"]:x}')
+            for wp_id, wp in list(self.watchpoints.items()):
+                is_write = 1 if wp['type'] == 'write' else 0
+                self._iss_cmd(f'watchpoint_remove {is_write} 0x{wp["addr"]:x} {wp["size"]}')
             self.breakpoints.clear()
-            print("All breakpoints deleted.")
+            self.watchpoints.clear()
+            print("All breakpoints and watchpoints deleted.")
             return
 
         try:
-            bp_id = int(arg)
+            item_id = int(arg)
         except ValueError:
-            print(f"Error: invalid breakpoint id '{arg}'")
+            print(f"Error: invalid id '{arg}'")
             return
 
-        if bp_id not in self.breakpoints:
-            print(f"Error: no breakpoint {bp_id}")
-            return
-
-        bp = self.breakpoints.pop(bp_id)
-        self._iss_cmd(f'breakpoint_remove 0x{bp["addr"]:x}')
-        print(f"Breakpoint {bp_id} deleted.")
+        if item_id in self.breakpoints:
+            bp = self.breakpoints.pop(item_id)
+            self._iss_cmd(f'breakpoint_remove 0x{bp["addr"]:x}')
+            print(f"Breakpoint {item_id} deleted.")
+        elif item_id in self.watchpoints:
+            wp = self.watchpoints.pop(item_id)
+            is_write = 1 if wp['type'] == 'write' else 0
+            self._iss_cmd(f'watchpoint_remove {is_write} 0x{wp["addr"]:x} {wp["size"]}')
+            print(f"Watchpoint {item_id} deleted.")
+        else:
+            print(f"Error: no breakpoint or watchpoint {item_id}")
 
     def do_info(self, arg):
         """Show information.
 
         Usage:
-          info breakpoints   - list all breakpoints
+          info breakpoints   - list all breakpoints and watchpoints
+          info registers     - show CPU registers
         """
         parts = arg.split()
         if not parts:
-            print("Usage: info breakpoints")
+            print("Usage: info breakpoints|registers")
             return
 
-        if parts[0] in ('breakpoints', 'break', 'b'):
-            if not self.breakpoints:
-                print("No breakpoints set.")
+        if parts[0] in ('breakpoints', 'break', 'b', 'watchpoints', 'watch', 'w'):
+            if not self.breakpoints and not self.watchpoints:
+                print("No breakpoints or watchpoints set.")
                 return
-            print(f"{'ID':<6} {'Address':<14} {'Symbol'}")
-            print("-" * 40)
+            print(f"{'ID':<6} {'Type':<8} {'Address':<14} {'Details'}")
+            print("-" * 50)
             for bp_id, bp in sorted(self.breakpoints.items()):
                 sym = self._addr_to_symbol(bp['addr']) or ''
-                print(f"{bp_id:<6} 0x{bp['addr']:08X}     {sym}")
+                print(f"{bp_id:<6} {'break':<8} 0x{bp['addr']:08X}     {sym}")
+            for wp_id, wp in sorted(self.watchpoints.items()):
+                kind = 'watch' if wp['type'] == 'write' else 'rwatch'
+                print(f"{wp_id:<6} {kind:<8} 0x{wp['addr']:08X}     size={wp['size']}")
         elif parts[0] in ('registers', 'reg', 'r'):
             self.do_reg('')
         else:
@@ -869,7 +966,7 @@ class GvsocConsole(cmd.Cmd):
     def complete_info(self, text, line, begidx, endidx):
         parts = line.split()
         if len(parts) == 2 or (len(parts) == 1 and not text):
-            subcmds = ['breakpoints', 'registers']
+            subcmds = ['breakpoints', 'registers', 'watchpoints']
             return [s for s in subcmds if s.startswith(text)]
         return []
 
