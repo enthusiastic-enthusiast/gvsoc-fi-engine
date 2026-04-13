@@ -118,6 +118,8 @@ class GvsocConsole(cmd.Cmd):
         self.iss_ptr = None  # cached ISS component pointer
         self.symbols = {}  # name -> addr
         self.sym_addrs = []  # sorted list of (addr, name) for reverse lookup
+        self.trace_file = None  # path to trace output file
+        self.trace_file_pos = 0  # current read position
         self._update_prompt()
 
     def preloop(self):
@@ -282,6 +284,7 @@ class GvsocConsole(cmd.Cmd):
         except ValueError:
             timestamp = None
         self._drain_notifications()
+        self._display_new_traces()
         self._update_prompt()
         time_str = format_time(timestamp) if timestamp is not None else "unknown"
         print(f"Stepped {count} cycle(s). Time: {time_str}")
@@ -1072,14 +1075,17 @@ class GvsocConsole(cmd.Cmd):
         """Set console options.
 
         Usage:
-          set router <path>   - set default router path for mem commands
-          set iss <path>      - set ISS component path for breakpoints
+          set router <path>      - set default router path for mem commands
+          set iss <path>         - set ISS component path for breakpoints
+          set tracefile <path>   - set trace output file for inline display
+          set tracefile off      - disable inline trace display
         """
         parts = arg.split(None, 1)
         if len(parts) < 2:
             print("Current settings:")
-            print(f"  router = {self.router_path}")
-            print(f"  iss    = {self.iss_path}")
+            print(f"  router    = {self.router_path}")
+            print(f"  iss       = {self.iss_path}")
+            print(f"  tracefile = {self.trace_file or '(not set)'}")
             return
 
         option, value = parts[0], parts[1]
@@ -1091,14 +1097,26 @@ class GvsocConsole(cmd.Cmd):
             self.iss_path = value
             self.iss_ptr = None  # Force re-resolution
             print(f"ISS path set to: {value}")
+        elif option == 'tracefile':
+            if value.lower() == 'off':
+                self.trace_file = None
+                self.trace_file_pos = 0
+                print("Inline trace display disabled.")
+            else:
+                path = os.path.expanduser(value)
+                if not os.path.exists(path):
+                    print(f"Warning: file '{path}' does not exist yet (will monitor when created)")
+                self.trace_file = path
+                self._sync_trace_pos()
+                print(f"Trace file set to: {path} (position: {self.trace_file_pos})")
         else:
             print(f"Unknown option: {option}")
-            print("Available: router, iss")
+            print("Available: router, iss, tracefile")
 
     def complete_set(self, text, line, begidx, endidx):
         parts = line.split()
         if len(parts) == 2 or (len(parts) == 1 and not text):
-            options = ['router', 'iss']
+            options = ['router', 'iss', 'tracefile']
             return [o for o in options if o.startswith(text)]
         return []
 
@@ -1151,6 +1169,7 @@ class GvsocConsole(cmd.Cmd):
         except ValueError:
             timestamp = None
         self._drain_notifications()
+        self._display_new_traces()
         self._update_prompt()
         if not quiet:
             if label is None:
@@ -1158,6 +1177,36 @@ class GvsocConsole(cmd.Cmd):
             time_str = format_time(timestamp) if timestamp is not None else "unknown"
             print(f"Stepped {label}. Time: {time_str}")
             self._check_breakpoint_hit()
+
+    def _display_new_traces(self):
+        """Read and display new lines from the trace file."""
+        if self.trace_file is None:
+            return
+        try:
+            with open(self.trace_file, 'r') as f:
+                f.seek(self.trace_file_pos)
+                new_data = f.read()
+                self.trace_file_pos = f.tell()
+            if new_data:
+                # Strip ANSI color codes for cleaner output
+                import re
+                clean = re.sub(r'\033\[[0-9;]*m', '', new_data)
+                # Print each line with a trace marker
+                for line in clean.rstrip('\n').split('\n'):
+                    line = line.strip()
+                    if line:
+                        print(f"  | {line}")
+        except (OSError, IOError):
+            pass
+
+    def _sync_trace_pos(self):
+        """Advance trace file position to end (skip existing content)."""
+        if self.trace_file is None:
+            return
+        try:
+            self.trace_file_pos = os.path.getsize(self.trace_file)
+        except OSError:
+            self.trace_file_pos = 0
 
     def _on_exit(self, status):
         """Callback when simulation exits (called from reader thread)."""
@@ -1198,9 +1247,14 @@ def main():
                         help="Proxy port (default: 42951)")
     parser.add_argument("--script", default=None,
                         help="Execute commands from file then exit")
+    parser.add_argument("--tracefile", default=None,
+                        help="Trace output file to monitor for inline display")
     args = parser.parse_args()
 
     console = GvsocConsole(args.host, args.port)
+    if args.tracefile:
+        console.trace_file = os.path.expanduser(args.tracefile)
+        console.trace_file_pos = os.path.getsize(console.trace_file) if os.path.exists(console.trace_file) else 0
     if args.script:
         console.run_script(args.script)
     else:
