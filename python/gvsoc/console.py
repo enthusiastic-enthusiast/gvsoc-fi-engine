@@ -849,15 +849,72 @@ class GvsocConsole(cmd.Cmd):
             print("-" * 24)
             for bp_id, bp in sorted(self.breakpoints.items()):
                 print(f"{bp_id:<6} 0x{bp['addr']:08X}")
+        elif parts[0] in ('registers', 'reg', 'r'):
+            self.do_reg('')
         else:
             print(f"Unknown info subcommand: {parts[0]}")
 
     def complete_info(self, text, line, begidx, endidx):
         parts = line.split()
         if len(parts) == 2 or (len(parts) == 1 and not text):
-            subcmds = ['breakpoints']
+            subcmds = ['breakpoints', 'registers']
             return [s for s in subcmds if s.startswith(text)]
         return []
+
+    # ──────────────────────────────────────────────
+    # Register Access
+    # ──────────────────────────────────────────────
+
+    RISCV_REG_NAMES = [
+        'zero', 'ra', 'sp', 'gp', 'tp', 't0', 't1', 't2',
+        's0', 's1', 'a0', 'a1', 'a2', 'a3', 'a4', 'a5',
+        'a6', 'a7', 's2', 's3', 's4', 's5', 's6', 's7',
+        's8', 's9', 's10', 's11', 't3', 't4', 't5', 't6',
+        'pc'
+    ]
+
+    def do_reg(self, arg):
+        """Read CPU registers.
+
+        Usage:
+          reg              - show all registers
+          reg <name>       - show a specific register (e.g. reg sp, reg pc, reg a0)
+        """
+        result = self._iss_cmd('reg_read')
+        if result is None:
+            return
+
+        values = result.strip().split()
+        if len(values) < 33:
+            print(f"Error: unexpected register response ({len(values)} values)")
+            return
+
+        regs = {}
+        for i, val in enumerate(values[:33]):
+            name = self.RISCV_REG_NAMES[i] if i < len(self.RISCV_REG_NAMES) else f'x{i}'
+            regs[name] = int(val, 0)
+            regs[f'x{i}'] = int(val, 0)
+
+        arg = arg.strip()
+        if arg:
+            name = arg.lower()
+            if name in regs:
+                print(f"{name} = 0x{regs[name]:08X} ({regs[name]})")
+            else:
+                print(f"Unknown register: {arg}")
+                print(f"Available: {', '.join(self.RISCV_REG_NAMES)}")
+        else:
+            # Print all registers in a compact table
+            for i in range(0, 32, 4):
+                parts = []
+                for j in range(4):
+                    idx = i + j
+                    if idx < 32:
+                        name = self.RISCV_REG_NAMES[idx]
+                        val = regs[name]
+                        parts.append(f"{name:>4} = 0x{val:08X}")
+                print('  '.join(parts))
+            print(f"  pc = 0x{regs['pc']:08X}")
 
     # ──────────────────────────────────────────────
     # Settings
