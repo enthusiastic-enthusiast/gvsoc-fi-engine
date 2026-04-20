@@ -15,9 +15,9 @@ It currently detects two kinds of invalid accesses:
 Usage
 +++++
 
-Memcheck can be enabled by adding the *--memcheck* option to the gapy or gvsoc command: ::
+Memcheck can be enabled by adding the *--memcheck* option: ::
 
-    gvsoc --target=gap.gap9.evk --binary=test image flash run --memcheck
+    gvrun --target gap.gap9.evk --parameter binary=test build run --memcheck
 
 This is the only option available for this feature.
 
@@ -151,7 +151,7 @@ This will report the following warning:
     Input error: Platform returned an error (exitcode: 1)
 
 The second kind of error occurs when the core tries to use an uninitialized value to build an
-address and accesses it. 
+address and accesses it.
 
 This can happen with the following code:
 

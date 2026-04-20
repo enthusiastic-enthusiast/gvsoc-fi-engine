@@ -4,7 +4,7 @@ GDB Server
 Introduction
 ............
 
-GVSOC can be launched with a GDB server to allow a GDB client to connect and debug the 
+GVSOC can be launched with a GDB server to allow a GDB client to connect and debug the
 simulated software.
 
 The GDB server does not simulate any real hardware like debug IPs but directly interacts with models
@@ -16,9 +16,9 @@ the models to ensure they are caught.
 Usage
 .....
 
-GVSOC can be launched with the GDB server using the *--gdb-server* option: ::
+GVSOC can be launched with the GDB server using the *--gdbserver* option: ::
 
-    gvsoc --target=gap.gap9.evk --binary=test image flash run --gdbserver
+    gvrun --target gap.gap9.evk --parameter binary=test build run --gdbserver
 
 This command starts GVSOC and opens an RSP port for the GDB client to connect to, which is printed
 on the console: ::
@@ -28,7 +28,7 @@ on the console: ::
 The port can be changed using the *--gdbserver-port* option, which is useful if multiple simulations
 are launched in parallel: ::
 
-    gvsoc --target=gap.gap9.evk --binary=test image flash run --gdbserver --gdbserver-port=10000
+    gvrun --target gap.gap9.evk --parameter binary=test build run --gdbserver --gdbserver-port=10000
 
 The simulation has not started yet and is waiting for the client to connect before continuing.
 

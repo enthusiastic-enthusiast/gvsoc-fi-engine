@@ -13,7 +13,7 @@ Usage
 
 VCD tracing can be activated using the *--vcd* option: ::
 
-    gvsoc --target=rv64 --binary=test run --vcd
+    gvrun --target rv64 --parameter binary=test run --vcd
 
 Once the platform runs, this generates two additional files in the working directory:
 
@@ -63,7 +63,7 @@ selected include: debug, asm, pc, core_events, and clock.
 
 Example: ::
 
-    gvsoc --target=rv64 --binary=test run --vcd --event-tag=debug --event-tag=core_events
+    gvrun --target rv64 --parameter binary=test run --vcd --event-tag=debug --event-tag=core_events
 
 Specific events can be selected with the option *--event=<name>*. This option can be given several
 times to specify multiple traces. Similar to system traces, the name is a regular expression that
@@ -72,4 +72,4 @@ enabled.
 
 Example to activate all traces: ::
 
-    gvsoc --target=rv64 --binary=test run --vcd --event=.*
+    gvrun --target rv64 --parameter binary=test run --vcd --event=.*

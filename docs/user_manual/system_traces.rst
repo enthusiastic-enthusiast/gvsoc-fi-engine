@@ -16,7 +16,7 @@ enabled and, optionally, a file where the traces should be dumped. All component
 the specified expression will dump traces. Several paths can be specified by using the option
 multiple times. Here is an example that activates instruction traces for core 0 and core 1: ::
 
-  gvsoc --target=gap.gap9.evk --binary=test run --trace=pe0/insn --trace=pe1/insn
+  gvrun --target gap.gap9.evk --parameter binary=test run --trace=pe0/insn --trace=pe1/insn
 
 The trace file should look like this: ::
 
@@ -109,8 +109,8 @@ to gather all traces or different files for separate traces.
 
 Example to dump all possible traces into one file: ::
 
-  gvsoc --target=gap.gap9.evk run --trace=.*:log.txt
+  gvrun --target gap.gap9.evk run --trace=.*:log.txt
 
 Example to dump instruction traces to one file and L2 memory accesses to another file: ::
 
-  gvsoc --target=gap.gap9.evk run --trace=insn:insn.txt --trace=l2:l2.txt
+  gvrun --target gap.gap9.evk run --trace=insn:insn.txt --trace=l2:l2.txt
