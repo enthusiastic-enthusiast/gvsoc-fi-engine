@@ -1,7 +1,9 @@
-"""Generate one Sphinx rst page per GVSoC component in ``components_registry``.
+"""Generate one Sphinx rst page per documented GVSoC component.
 
-Invoked from ``conf.py`` at doc build time. The output goes into
-``components/_generated/`` and is gitignored.
+Invoked from ``conf.py`` at doc build time. Discovery walks every module
+root in ``GVSOC_MODULES`` for classes that declare a ``__gvsoc_doc__``
+class attribute; each matching class becomes one page under
+``components/_generated/`` (gitignored).
 
 For each registered component we emit:
 
@@ -10,7 +12,7 @@ For each registered component we emit:
   - A ``Ports`` section scraped from the generator's source via ``ast``
     (listing ``i_*`` / ``o_*`` methods plus their first-line docstring).
   - A ``Tests`` section built by ``ast``-walking every ``testset.cfg`` under
-    the component's tests directory.
+    each ``tests_dirs`` entry declared on ``__gvsoc_doc__``.
 
 AST is used rather than ``import`` + introspection so a broken import in one
 generator does not take down the whole doc build.
@@ -577,8 +579,85 @@ def _load_coverage() -> dict | None:
         return None
 
 
-def generate(doc_root: Path, repo_root: Path, registry: list[dict]) -> None:
-    """Generate all component pages under ``doc_root/components/_generated``."""
+# --------------------------------------------------------------------------- #
+# Discovery                                                                   #
+# --------------------------------------------------------------------------- #
+
+def _class_attr_literal(cls: ast.ClassDef, name: str):
+    """Return the value of a class-level ``name = <literal>`` assignment.
+
+    Uses ``ast.literal_eval`` on the RHS, so the attribute must be a plain
+    Python literal (dict / list / tuple / str / int / bool / None, nested).
+    Returns ``None`` when the attribute is absent or the RHS isn't a
+    literal.
+    """
+    for stmt in cls.body:
+        if not isinstance(stmt, ast.Assign):
+            continue
+        for tgt in stmt.targets:
+            if isinstance(tgt, ast.Name) and tgt.id == name:
+                try:
+                    return ast.literal_eval(stmt.value)
+                except (ValueError, SyntaxError):
+                    return None
+    return None
+
+
+def _discover_components(roots: list[Path]) -> list[dict]:
+    """Walk every module root and build the registry from ``__gvsoc_doc__``.
+
+    AST-only so a broken import in one generator doesn't kill the build —
+    same policy used by :func:`_extract_tests`. The dotted module path is
+    derived from the file's location under the first root that contains
+    it; two roots shadowing the same relative path keep the first match.
+    """
+    seen: set[tuple[str, str]] = set()
+    entries: list[dict] = []
+    for root in roots:
+        for py_path in sorted(root.rglob('*.py')):
+            try:
+                tree = ast.parse(py_path.read_text())
+            except (OSError, SyntaxError):
+                continue
+
+            try:
+                rel = py_path.relative_to(root).with_suffix('')
+            except ValueError:
+                continue
+            module = '.'.join(rel.parts)
+            if not module:
+                continue
+
+            for node in tree.body:
+                if not isinstance(node, ast.ClassDef):
+                    continue
+                doc = _class_attr_literal(node, '__gvsoc_doc__')
+                if not isinstance(doc, dict):
+                    continue
+                key = (module, node.name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                entry = {
+                    'module':     module,
+                    'class':      node.name,
+                    'title':      doc.get('title') or f'{module}.{node.name}',
+                    'tests_dirs': doc.get('tests_dirs') or [],
+                }
+                if 'coverage_aggregate' in doc:
+                    entry['coverage_aggregate'] = doc['coverage_aggregate']
+                entries.append(entry)
+    entries.sort(key=lambda e: (e['module'], e['class']))
+    return entries
+
+
+def generate(doc_root: Path, repo_root: Path) -> None:
+    """Generate all component pages under ``doc_root/components/_generated``.
+
+    The registry is discovered at doc-build time by AST-scanning every
+    module root in ``GVSOC_MODULES`` for classes that declare a
+    ``__gvsoc_doc__`` class attribute. No static registry file.
+    """
     out_dir = doc_root / 'components' / '_generated'
     if out_dir.exists():
         shutil.rmtree(out_dir)
@@ -591,6 +670,7 @@ def generate(doc_root: Path, repo_root: Path, registry: list[dict]) -> None:
         if sr not in sys.path:
             sys.path.insert(0, sr)
 
+    registry = _discover_components(roots)
     coverage = _load_coverage()
 
     rendered: list[tuple[str, str]] = []

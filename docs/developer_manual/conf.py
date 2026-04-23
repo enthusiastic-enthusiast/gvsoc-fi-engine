@@ -30,10 +30,11 @@ subprocess.call('doxygen doxyfile', shell=True)
 
 # -- Component doc generation ------------------------------------------------
 #
-# Walks GVSOC_MODULES and emits one rst page per component listed in
-# components_registry.COMPONENTS. The output goes into
-# components/_generated/ (gitignored). If GVSOC_MODULES is not set, component
-# pages are skipped entirely — the Makefile's `doc` target exports it.
+# Walks GVSOC_MODULES, AST-scans every generator .py for classes that
+# declare a ``__gvsoc_doc__`` class attribute, and emits one rst page per
+# match. The output goes into components/_generated/ (gitignored). If
+# GVSOC_MODULES is not set, component pages are skipped entirely — the
+# Makefile's `doc` target exports it.
 
 _DOC_ROOT = Path(__file__).resolve().parent
 _REPO_ROOT = _DOC_ROOT.parents[3]  # .../gvsoc/engine/docs/developer_manual -> repo root
@@ -47,11 +48,9 @@ if os.environ.get('GVSOC_MODULES'):
             sys.path.insert(0, str(extra))
 
     sys.path.insert(0, str(_DOC_ROOT / '_ext'))
-    sys.path.insert(0, str(_DOC_ROOT))
     import component_pages  # noqa: E402
-    from components_registry import COMPONENTS  # noqa: E402
 
-    component_pages.generate(_DOC_ROOT, _REPO_ROOT, COMPONENTS)
+    component_pages.generate(_DOC_ROOT, _REPO_ROOT)
 else:
     print('GVSOC_MODULES not set — skipping component page generation.')
     # Leave a stub so components/index.rst's toctree still resolves.
