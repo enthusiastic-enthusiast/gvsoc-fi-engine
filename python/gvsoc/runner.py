@@ -330,7 +330,12 @@ if os.environ.get('USE_GVRUN') is None:
             self.args = args
 
         def _collect_config_classes(self, component):
-            """Walk the component tree and collect unique Config classes for header generation."""
+            """Walk the component tree and collect unique Config classes for header generation.
+
+            Keyed by ``(__module__, __qualname__)`` so two Config classes
+            with the same ``__name__`` but in different modules are both
+            kept and generate separate headers.
+            """
             from dataclasses import is_dataclass
             try:
                 from gvrun.config_gen import get_config_fields
@@ -340,9 +345,12 @@ if os.environ.get('USE_GVRUN') is None:
             classes = {}
 
             def _add(cls):
-                if cls is None or cls.__name__ in classes:
+                if cls is None:
                     return
-                classes[cls.__name__] = cls
+                key = (cls.__module__, cls.__qualname__)
+                if key in classes:
+                    return
+                classes[key] = cls
                 if get_config_fields is None:
                     return
                 # Recursively pull in element classes of list-of-Config fields
@@ -369,10 +377,10 @@ if os.environ.get('USE_GVRUN') is None:
                 return
 
             config_classes = self._collect_config_classes(target)
-            for cls_name, config_cls in config_classes.items():
+            for config_cls in config_classes.values():
                 mod_parts = config_cls.__module__.split('.')
-                subdir = mod_parts[0] if len(mod_parts) >= 2 else ''
-                snake = re.sub(r'(?<!^)(?=[A-Z])', '_', cls_name).lower()
+                subdir = os.path.join(*mod_parts) if mod_parts and mod_parts[0] else ''
+                snake = re.sub(r'(?<!^)(?=[A-Z])', '_', config_cls.__name__).lower()
                 header_dir = os.path.join(builddir, subdir)
                 header_path = os.path.join(header_dir, f'{snake}.hpp')
                 generate_cpp_header(config_cls, output_path=header_path)

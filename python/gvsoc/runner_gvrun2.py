@@ -335,14 +335,19 @@ class Runner():
         self.args = args
 
     def _collect_config_classes(self, component):
-        """Walk the component tree and collect unique Config classes for header generation."""
+        """Walk the component tree and collect unique Config classes for header generation.
+
+        Keyed by ``(__module__, __qualname__)`` so two Config classes that
+        share the same ``__name__`` but live in different modules (e.g. an
+        old and a new flavour of the same model) are both kept and emitted
+        to distinct headers.
+        """
         from dataclasses import is_dataclass
         classes = {}
         config = getattr(component, '_component_config', None)
         if config is not None and is_dataclass(config):
             cls = type(config)
-            if cls.__name__ not in classes:
-                classes[cls.__name__] = cls
+            classes[(cls.__module__, cls.__qualname__)] = cls
         for child in getattr(component, 'components', {}).values():
             classes.update(self._collect_config_classes(child))
         return classes
@@ -390,10 +395,10 @@ class Runner():
             return
 
         config_classes = self._collect_config_classes(target)
-        for cls_name, config_cls in config_classes.items():
+        for config_cls in config_classes.values():
             mod_parts = config_cls.__module__.split('.')
-            subdir = mod_parts[0] if len(mod_parts) >= 2 else ''
-            snake = _re.sub(r'(?<!^)(?=[A-Z])', '_', cls_name).lower()
+            subdir = os.path.join(*mod_parts) if mod_parts and mod_parts[0] else ''
+            snake = _re.sub(r'(?<!^)(?=[A-Z])', '_', config_cls.__name__).lower()
             header_dir = os.path.join(builddir, subdir)
             header_path = os.path.join(header_dir, f'{snake}.hpp')
             generate_cpp_header(config_cls, output_path=header_path)
