@@ -1,6 +1,6 @@
 include ../utils/rt.mk
 
-GVSOC_ROOT = ../../../../..
+GVSOC_ROOT ?= ../../../../..
 GVSOC_ENGINE ?= ../../../../../engine
 GVSOC_WORKDIR ?= $(CURDIR)/build
 ifdef BUILDDIR
