@@ -261,6 +261,26 @@ namespace vp {
         virtual void reset_all(bool active, bool from_itf=false);
 
         /**
+         * @brief Notify the block that the engine has just paused
+         *
+         * Called by the time engine after run() returns (either because the
+         * GUI requested a pause, or because no more events are scheduled).
+         * Override in components that need to react — e.g. flush a buffered
+         * trace stream so the GUI sees up-to-date values when the user
+         * pauses simulation.
+         *
+         * The default implementation is a no-op.
+         */
+        virtual void on_pause() {}
+
+        /**
+         * @brief Recursively call on_pause on this block and all its
+         * children. Used by the framework; component code typically just
+         * overrides on_pause and lets the framework drive the walk.
+         */
+        void pause_all();
+
+        /**
          * @brief Give access to memcheck features
          *
          * Memories and chunk allocation/free can be declared to this object so that it can

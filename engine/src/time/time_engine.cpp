@@ -136,6 +136,14 @@ int64_t vp::TimeEngine::run()
     this->run_returned = false;
     int64_t time = this->exec();
     this->run_returned = true;
+    /* Engine just paused (either user-requested via stop_req, or natural
+       exhaustion of the event queue). Walk the tree so components that
+       buffer state — e.g. the verilator plugin's VCD parser — can flush
+       to the GUI. */
+    if (this->top != nullptr)
+    {
+        this->top->pause_all();
+    }
     return time;
 }
 

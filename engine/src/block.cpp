@@ -90,6 +90,16 @@ std::string vp::Block::get_path_from_parents()
 }
 
 
+void vp::Block::pause_all()
+{
+    this->on_pause();
+    for (Block *block : this->childs)
+    {
+        block->pause_all();
+    }
+}
+
+
 void vp::Block::reset_all(bool active, bool from_itf)
 {
     if (!this->reset_is_bound || from_itf)
