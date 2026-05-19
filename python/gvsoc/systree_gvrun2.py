@@ -30,9 +30,30 @@ import hashlib
 import rich.table
 from gvrun.runtime import is_runtime_annotation
 from gvrun.parameter import TargetParameter
+from gvsoc.signature import Signature
 
 
 generated_components = {}
+
+
+def _signatures_match(master_sig, slave_sig):
+    """Bind-time compatibility check between two signatures.
+
+    Accepts any combination of legacy strings and :class:`Signature`
+    instances. Two strings match by equality. A ``Signature`` matches a
+    string when the signature's ``tag`` equals the string (or vice versa).
+    Two ``Signature`` instances match when ``master_sig.is_compatible(slave_sig)``
+    or the auto-bridge pass can handle the mismatch later; here we only
+    block bindings that are definitively unrelated (e.g. an ``io`` master
+    on a ``wire<bool>`` slave). That means: same tag, or master is a
+    ``Signature`` whose tag matches the slave's tag/string.
+    """
+    if master_sig is None or slave_sig is None:
+        return True
+
+    master_tag = master_sig.tag if isinstance(master_sig, Signature) else master_sig
+    slave_tag = slave_sig.tag if isinstance(slave_sig, Signature) else slave_sig
+    return master_tag == slave_tag
 
 
 class GeneratedComponent(object):
@@ -90,11 +111,14 @@ class SlaveItf():
         The component which the slave interface belongs to.
     itf_name: str
         The name of the slave interface.
-    signature: str
-        The signature of the interface. If specified, this is used to check that the interface
-        is bound to a master interface of the same signature.
+    signature: str or Signature
+        The signature of the interface. Accepts either the legacy string form
+        (e.g. ``'io_v2'``, ``'wire<bool>'``) or a class-based ``Signature``
+        instance (e.g. ``IoV2Beat(beat_width=64)``). When both sides of a
+        binding declare class-based signatures, the framework auto-inserts a
+        bridge component if the master signature reports incompatibility.
     """
-    def __init__(self, component: 'Component', itf_name: str, signature: str=None):
+    def __init__(self, component: 'Component', itf_name: str, signature=None):
         self.component = component
         self.itf_name = itf_name
         self.signature = signature
@@ -378,7 +402,7 @@ class Component(gvrun.target.SystemTreeNode):
         """
         self.c_flags += flags
 
-    def itf_bind(self, master_itf_name: str, slave_itf: SlaveItf, signature: str=None,
+    def itf_bind(self, master_itf_name: str, slave_itf: SlaveItf, signature=None,
             composite_bind: bool=False):
         """Bind to a slave interface.
 
@@ -393,21 +417,28 @@ class Component(gvrun.target.SystemTreeNode):
             Name of the master interface to be bound.
         slave_itf : SlaveItf
             Slave interface to which the master interface should be bound.
-        signature : str
-            The signature of the interface. If specified, this is used to check that the interface
-            is bound to a slave interface of the same signature.
+        signature : str or Signature
+            The signature of the interface. Accepts either the legacy string
+            form or a class-based ``Signature`` instance. When both sides
+            declare class-based signatures, the framework auto-inserts a
+            bridge component if the master signature reports incompatibility
+            with the slave signature.
         """
 
         if signature is not None and slave_itf.signature is not None and \
-                signature != slave_itf.signature:
-            master_name = f'{signature}@{self.get_path()}->{master_itf_name}'
-            slave_name = f'{slave_itf.signature}@{slave_itf.component.get_path()}->{slave_itf.itf_name}'
+                not _signatures_match(signature, slave_itf.signature):
+            def _label(sig):
+                return type(sig).__name__ if isinstance(sig, Signature) else sig
+            master_name = f'{_label(signature)}@{self.get_path()}->{master_itf_name}'
+            slave_name = f'{_label(slave_itf.signature)}@{slave_itf.component.get_path()}->{slave_itf.itf_name}'
             raise RuntimeError(f'Invalid signature (master: {master_name}, slave: {slave_name})')
 
         if composite_bind:
-            self.bind(self, master_itf_name, slave_itf.component, slave_itf.itf_name)
+            self.bind(self, master_itf_name, slave_itf.component, slave_itf.itf_name,
+                      master_signature=signature, slave_signature=slave_itf.signature)
         else:
-            self.parent.bind(self, master_itf_name, slave_itf.component, slave_itf.itf_name)
+            self.parent.bind(self, master_itf_name, slave_itf.component, slave_itf.itf_name,
+                             master_signature=signature, slave_signature=slave_itf.signature)
 
     def regmap_gen(self, template, outdir, name, block=None, headers=['regfields', 'gvsoc']):
         import regmap.regmap
@@ -498,7 +529,8 @@ class Component(gvrun.target.SystemTreeNode):
         return property
 
 
-    def bind(self, master, master_itf, slave, slave_itf, master_properties=None, slave_properties=None):
+    def bind(self, master, master_itf, slave, slave_itf, master_properties=None, slave_properties=None,
+             master_signature=None, slave_signature=None):
         """Binds 2 components together.
 
         The binding can actually also involve 1 or 2 ports of the component to model bindings with something
@@ -514,8 +546,13 @@ class Component(gvrun.target.SystemTreeNode):
             Slave component. Can also be self if the slave is outside this component.
         slave_itf : str
             Name of the port where the binding should be done on slave side.
+        master_signature : str or Signature
+            Optional master-side signature (class-based or legacy string).
+        slave_signature : str or Signature
+            Optional slave-side signature (class-based or legacy string).
         """
-        self.bindings.append([master, master_itf, slave, slave_itf, master_properties, slave_properties])
+        self.bindings.append([master, master_itf, slave, slave_itf, master_properties, slave_properties,
+                              master_signature, slave_signature])
 
     def slave_itf(self, name: str, signature: str):
         return SlaveItf(self, name, signature=signature)
@@ -757,9 +794,16 @@ class Component(gvrun.target.SystemTreeNode):
 
     def __build(self):
 
+        # Auto-insert signature bridges for itf_bind() bindings. This must run
+        # before children are recursed (so the rewritten bindings are visible
+        # at this level) and before the Interface-path bindings are appended
+        # (those use the legacy mechanism and are not subject to bridging).
+        self.__expand_signature_bridges()
+
         for interface in self.interfaces:
             self.bindings.append([interface.comp, interface.name, interface.remote_itf.comp,
-                interface.remote_itf.name, interface.properties, interface.remote_itf.properties])
+                interface.remote_itf.name, interface.properties, interface.remote_itf.properties,
+                None, None])
 
         for component in self.components.values():
             component.__build()
@@ -775,6 +819,71 @@ class Component(gvrun.target.SystemTreeNode):
         if self.component is None and len(self.sources) != 0:
             self.generated_component = get_generated_component(self.sources, self.c_flags)
             self.add_property('vp_component', self.generated_component.name)
+
+    def __expand_signature_bridges(self):
+        """Walk this component's bindings and insert auto-bridge components
+        where the master signature reports incompatibility with the slave.
+
+        The master signature must be a class-based :class:`Signature` instance
+        for the framework to consider auto-bridging. The slave signature can
+        be either a :class:`Signature` instance or a legacy string — leaving
+        a fallback for masters that upgraded to the class-based API while the
+        bound slave is still declared with the historic ``signature='...'``
+        string. The master signature's ``bridge_to`` decides what (if anything)
+        to insert.
+
+        Bindings with no class-based master signature are left untouched.
+
+        The bridge component registers itself as a child of ``self`` via the
+        normal ``Component.__init__`` parent argument. The two replacement
+        bindings inherit the master signature on the master leg and the slave
+        signature on the slave leg, so the recursive expansion is idempotent.
+        Each inserted bridge also gets a clock binding cloned from the master
+        component's existing clock binding so the framework-injected bridge
+        is fully clocked without the user having to wire it manually.
+        """
+        expanded = []
+        # Pre-index existing clock bindings so we can clone the master's
+        # clock for any bridge we insert.
+        clock_by_comp = {}
+        for binding in self.bindings:
+            if binding[3] == 'clock':
+                # binding shape: [src, src_port, dst_comp, 'clock', ..., ..., ..., ...]
+                clock_by_comp[binding[2]] = (binding[0], binding[1])
+
+        new_clock_bindings = []
+        for binding in self.bindings:
+            master_sig = binding[6]
+            slave_sig = binding[7]
+            if not isinstance(master_sig, Signature):
+                expanded.append(binding)
+                continue
+
+            bridge_name = f'{binding[0].name}_{binding[1]}_bridge'
+            bridge = master_sig.bridge_to(slave_sig, parent=self, name=bridge_name)
+            if bridge is None:
+                expanded.append(binding)
+                continue
+
+            # Rewrite the binding pair to route master -> bridge.input ->
+            # bridge.output -> slave. The bridge's own ports use the same
+            # signature on each end, so the next expansion pass over those
+            # bindings is a no-op.
+            expanded.append([binding[0], binding[1], bridge, 'input',
+                             binding[4], None,
+                             master_sig, master_sig])
+            expanded.append([bridge, 'output', binding[2], binding[3],
+                             None, binding[5],
+                             slave_sig, slave_sig])
+
+            # Propagate the master's clock domain to the bridge so it has a
+            # valid ClockEngine to schedule its FSM event on.
+            clock_src = clock_by_comp.get(binding[0])
+            if clock_src is not None:
+                new_clock_bindings.append([clock_src[0], clock_src[1], bridge, 'clock',
+                                           None, None, None, None])
+
+        self.bindings = expanded + new_clock_bindings
 
     def finalize(self):
         pass

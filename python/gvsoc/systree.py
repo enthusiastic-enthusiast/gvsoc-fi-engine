@@ -367,16 +367,35 @@ else:
                 is bound to a slave interface of the same signature.
             """
 
+            # Tolerate class-based ``Signature`` instances on the legacy
+            # path: compare them by their ``tag`` so user code that declares a
+            # ``Signature`` for the gvrun2 auto-bridging still validates here.
+            from gvsoc.signature import Signature
+            def _sig_tag(s):
+                return s.tag if isinstance(s, Signature) else s
+
             if signature is not None and slave_itf.signature is not None and \
-                    signature != slave_itf.signature:
-                master_name = f'{signature}@{self.get_path()}->{master_itf_name}'
-                slave_name = f'{slave_itf.signature}@{slave_itf.component.get_path()}->{slave_itf.itf_name}'
+                    _sig_tag(signature) != _sig_tag(slave_itf.signature):
+                def _label(s):
+                    return type(s).__name__ if isinstance(s, Signature) else s
+                master_name = f'{_label(signature)}@{self.get_path()}->{master_itf_name}'
+                slave_name = f'{_label(slave_itf.signature)}@{slave_itf.component.get_path()}->{slave_itf.itf_name}'
                 raise RuntimeError(f'Invalid signature (master: {master_name}, slave: {slave_name})')
 
+            # The legacy systree also runs the auto-bridge pass at __build
+            # time so the gapy-generated tree.cpp is consistent with the
+            # gvrun2 run-time systree (which inserts bridges via the same
+            # mechanism). Without this, the .so compiled from tree.cpp
+            # would lack the bridge component, and the engine would fall
+            # back to the JSON path that does not populate dataclass cfgs.
+            # We just forward the signatures down to ``bind``; the bridge
+            # rewriting happens later in ``__build``.
             if composite_bind:
-                self.bind(self, master_itf_name, slave_itf.component, slave_itf.itf_name)
+                self.bind(self, master_itf_name, slave_itf.component, slave_itf.itf_name,
+                          master_signature=signature, slave_signature=slave_itf.signature)
             else:
-                self.parent.bind(self, master_itf_name, slave_itf.component, slave_itf.itf_name)
+                self.parent.bind(self, master_itf_name, slave_itf.component, slave_itf.itf_name,
+                                 master_signature=signature, slave_signature=slave_itf.signature)
 
         def gen_stimuli(self):
             """Generate stimuli.
@@ -610,7 +629,8 @@ else:
             return property
 
 
-        def bind(self, master: Component, master_itf: str, slave: Component, slave_itf: str, master_properties=None, slave_properties=None):
+        def bind(self, master: Component, master_itf: str, slave: Component, slave_itf: str, master_properties=None, slave_properties=None,
+                 master_signature=None, slave_signature=None):
             """Binds 2 components together.
 
             The binding can actually also involve 1 or 2 ports of the component to model bindings with something
@@ -626,8 +646,13 @@ else:
                 Slave component. Can also be self if the slave is outside this component.
             slave_itf : str
                 Name of the port where the binding should be done on slave side.
+            master_signature, slave_signature : str or Signature
+                Optional class-based ``Signature`` instances stored on the
+                binding for the auto-bridge pass in ``__build``. Legacy
+                string signatures are passed through unchanged.
             """
-            self.bindings.append([master, master_itf, slave, slave_itf, master_properties, slave_properties])
+            self.bindings.append([master, master_itf, slave, slave_itf, master_properties, slave_properties,
+                                  master_signature, slave_signature])
 
         def slave_itf(self, name: str, signature: str):
             return SlaveItf(self, name, signature=signature)
@@ -879,9 +904,15 @@ else:
 
         def __build(self):
 
+            # Auto-insert signature bridges for itf_bind() bindings. Must run
+            # before children are recursed and before the Interface path
+            # appends its own (non-bridge) bindings.
+            self.__expand_signature_bridges()
+
             for interface in self.interfaces:
                 self.bindings.append([interface.comp, interface.name, interface.remote_itf.comp,
-                    interface.remote_itf.name, interface.properties, interface.remote_itf.properties])
+                    interface.remote_itf.name, interface.properties, interface.remote_itf.properties,
+                    None, None])
 
             for component in self.components.values():
                 component.__build()
@@ -906,6 +937,49 @@ else:
 
                     if self.variant is not None:
                         self.add_property('vp_component', variants[self.variant].name)
+
+        def __expand_signature_bridges(self):
+            """Walk this component's bindings and insert auto-bridge components
+            where the master ``Signature`` reports incompatibility with the
+            slave. Mirror of the same pass on the gvrun2 path. Kept here so the
+            gapy-built tree.cpp matches the gvrun2 run-time systree (otherwise
+            the engine falls back to the JSON-only path that cannot populate
+            dataclass cfgs).
+            """
+            from gvsoc.signature import Signature
+            expanded = []
+            clock_by_comp = {}
+            for binding in self.bindings:
+                if binding[3] == 'clock':
+                    clock_by_comp[binding[2]] = (binding[0], binding[1])
+
+            new_clock_bindings = []
+            for binding in self.bindings:
+                master_sig = binding[6] if len(binding) > 6 else None
+                slave_sig = binding[7] if len(binding) > 7 else None
+                if not isinstance(master_sig, Signature):
+                    expanded.append(binding)
+                    continue
+
+                bridge_name = f'{binding[0].name}_{binding[1]}_bridge'
+                bridge = master_sig.bridge_to(slave_sig, parent=self, name=bridge_name)
+                if bridge is None:
+                    expanded.append(binding)
+                    continue
+
+                expanded.append([binding[0], binding[1], bridge, 'input',
+                                 binding[4], None,
+                                 master_sig, master_sig])
+                expanded.append([bridge, 'output', binding[2], binding[3],
+                                 None, binding[5],
+                                 slave_sig, slave_sig])
+
+                clock_src = clock_by_comp.get(binding[0])
+                if clock_src is not None:
+                    new_clock_bindings.append([clock_src[0], clock_src[1], bridge, 'clock',
+                                               None, None, None, None])
+
+            self.bindings = expanded + new_clock_bindings
 
         def finalize(self):
             pass

@@ -5,10 +5,12 @@ The v2 iDMA is the :doc:`io_v2 <../../../interfaces/io_v2>` port of
 the PULP iDMA family, living under
 ``gvsoc/pulp/models/pulp/ips/pulp/idma_v2/`` and exposed at Python
 module path ``ips.pulp.idma_v2``. Every IO port speaks the v2 IO
-protocol (``vp/itf/io_v2.hpp``) and every burst flows through the
-reusable :class:`BeatResponseAdapter` so the back-ends see a uniform
-per-beat callback stream regardless of how the downstream slave
-chooses to respond.
+protocol (``vp/itf/io_v2.hpp``). The AXI back-ends declare their
+outbound masters with ``signature=IoV2Beat(beat_width=axi_width)``
+so the framework auto-inserts a ``utils.io_v2_beat_adapter`` on
+any path whose downstream slave is ``IoV2BigPacket`` — that lets
+the back-ends consume a uniform per-beat ``resp()`` stream
+regardless of how the slave chose to respond.
 
 Architecture
 ------------
@@ -36,7 +38,9 @@ three layered C++ sub-blocks into one shared library:
     │   Back-end   │  Single AXI read/write back-end pair —
     └──────┬───────┘  every burst goes out on the AXI master.
            │
-           │  io_v2 master, routed through BeatResponseAdapter
+           │  io_v2 master (signature=IoV2Beat(axi_width))
+           │  framework inserts utils.io_v2_beat_adapter on the
+           │  path when the slave is IoV2BigPacket
            ▼
         bus / memory
 
@@ -49,8 +53,11 @@ generators :class:`ips.pulp.idma_v2.reg_dma.RegDmaV2`,
 Beat-streaming response normalisation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-The AXI back-end (``be/idma_be_axi.cpp``) routes its bus-facing
-master through a :class:`utils.io_v2_beat_adapter.BeatResponseAdapter`.
+The AXI back-end (``be/idma_be_axi.cpp``) declares its bus-facing
+master with ``signature=IoV2Beat(beat_width=axi_width)``. On any
+binding whose downstream slave is ``IoV2BigPacket`` (or the legacy
+``'io_v2'`` string), the framework auto-inserts a
+``utils.io_v2_beat_adapter`` between the AXI master and the slave.
 A logical read burst is issued as one io_v2 ``req()`` with ``size =
 total_burst_bytes`` and ``is_first = is_last = true``. Whatever form
 the downstream slave chooses to answer — sync ``IO_REQ_DONE``, async
@@ -59,25 +66,22 @@ big-packet ``resp()``, or native beat ``resp()`` — the adapter spreads
 ``now + req->latency`` with a per-beat step of
 ``max(1, latency / N)``. This avoids double-counting when an upstream
 router (e.g. ``router_v2_bandwidth``) already encodes the bandwidth
-cost in ``req->latency``. The back-end's ``on_beat`` handler forwards
-each chunk straight to the destination back-end when the BE can
-accept, saving an extra fsm-hop per beat.
+cost in ``req->latency``. The back-end's ``resp_meth`` callback
+forwards each chunk straight to the destination back-end when the BE
+can accept, saving an extra fsm-hop per beat.
 
 Writes still stream beat-by-beat: one io_v2 ``req()`` per
 ``axi_width`` bytes with ``is_first`` / ``is_last`` / ``burst_id``
-set per beat. Each beat's response feeds a single ``on_beat``
+set per beat. Each beat's response feeds a single ``resp_meth``
 callback that walks the source-side ack FIFO so write completion
 follows the slowest-of-source-and-destination semantics.
 
-The adapter is a generic utility under
-``gvsoc/core/models/utils/io_v2_beat_adapter.{hpp,cpp}`` and is also
-used by ``router_v2_beat`` (one adapter per output port). See the
-top-of-file comment in ``io_v2_beat_adapter.hpp`` for the
-three-point rule governing **when** an io_v2 component should use
-it — only beat-fidelity midboxes and initiators that feed a
-per-beat consumer at cycle-accurate spacing qualify; functional
-passthroughs, request-side latency annotators and terminal targets
-do not.
+When the slave is itself ``IoV2Beat`` with the same ``beat_width``
+(e.g. a chain ``idma_be_axi → router_v2_beat → ...``), the framework
+sees the signatures as compatible and inserts no adapter — the bus
+flows beat-to-beat end-to-end. See the :doc:`io_v2 protocol page
+<../../../interfaces/io_v2>` (`Beat-fidelity consumers`_ section)
+for the full signature matrix and rules.
 
 Front-ends
 ----------
@@ -117,8 +121,10 @@ fields as constructor keyword arguments. The fields are:
    :show-inheritance:
 
 ``axi_width`` drives the beat-streaming math: it is the beat size on
-the AXI master, and the number of beats spread by the
-:class:`BeatResponseAdapter` is ``ceil(burst_size / axi_width)``.
+the AXI master (and the ``beat_width`` of the ``IoV2Beat`` signature
+declared on the AXI ports), and the number of beats spread by the
+auto-inserted ``utils.io_v2_beat_adapter`` is
+``ceil(burst_size / axi_width)``.
 
 Middle-end (2D iterator)
 ------------------------
@@ -213,13 +219,15 @@ Class: ``IDmaBeAxi``
 (``gvsoc/pulp/models/pulp/ips/pulp/idma_v2/be/idma_be_axi.cpp``).
 
 The AXI back-end is the most complex of the two protocol back-ends
-because it actually models an AXI-like beat-streaming bus through a
-:class:`BeatResponseAdapter`. The single source file is instantiated
+because it actually models an AXI-like beat-streaming bus. Its
+``axi_read`` / ``axi_write`` master ports declare
+``signature=IoV2Beat(beat_width=axi_width)`` and the framework
+auto-inserts a ``utils.io_v2_beat_adapter`` on every path whose
+slave is ``IoV2BigPacket``. The single source file is instantiated
 **twice** by every iDMA generator (``be_axi_read`` and
 ``be_axi_write``) so reads and writes hold separate slot pools and
-appear as two independent io_v2 master ports
-(``axi_read`` / ``axi_write``). Both instances share the same
-``axi_width`` and ``burst_queue_size``.
+appear as two independent io_v2 master ports. Both instances share
+the same ``axi_width`` and ``burst_queue_size``.
 
 Slot pool
 ~~~~~~~~~
@@ -249,20 +257,21 @@ Read pipeline
      read burst** with ``size = total_size``,
      ``is_first = is_last = true``, ``burst_id = slot``. It then
      leaves ``pending_bursts``.
-  3. The :class:`BeatResponseAdapter` normalises whatever response
-     form the slave produced (sync DONE, async big-packet, beat
-     stream) into ``ceil(total_size / axi_width)`` ``on_beat``
-     callbacks. The adapter spreads the beats so the last one
-     lands at ``now + req->latency``, with per-beat step
-     ``max(1, latency / N)``. Throughput therefore matches the
+  3. The auto-inserted ``utils.io_v2_beat_adapter`` normalises
+     whatever response form the slave produced (sync DONE, async
+     big-packet, beat stream) into ``ceil(total_size / axi_width)``
+     per-beat ``resp()`` calls. The adapter spreads the beats so
+     the last one lands at ``now + req->latency``, with per-beat
+     step ``max(1, latency / N)``. Throughput therefore matches the
      slave's announced cost (i.e. a router_v2_bandwidth's
      ``burst_duration = size / bandwidth`` translates directly to
      "one beat per ``bandwidth / axi_width`` cycles").
-  4. Each ``on_beat`` carries ``(data, size, offset)``. If the
-     destination back-end can take a chunk now
+  4. Each ``resp_meth`` callback sees ``req->data``, ``req->size``
+     and ``req->is_first``/``is_last`` mutated for the current
+     beat. If the destination back-end can take a chunk now
      (``be->is_ready_to_accept_data``) the AXI back-end calls
-     ``be->write_data`` **synchronously inside on_beat** and
-     queues an ack record on ``read_ack_queue`` — saving the
+     ``be->write_data`` **synchronously inside the resp callback**
+     and queues an ack record on ``read_ack_queue`` — saving the
      1-cycle FSM hop that a queue-and-drain design would cost. If
      the destination is back-pressured, the chunk parks on
      ``read_push_queue`` and the back-end's own FSM drains it
@@ -304,10 +313,10 @@ Write pipeline
      their bytes have arrived from the source). Each beat carries
      its slot id as ``burst_id`` plus per-beat ``is_first`` /
      ``is_last`` flags. Pacing is one beat per cycle.
-  4. ``on_beat`` on a write beat advances ``bytes_responded``
-     by ``event.size`` and then walks ``write_pending_acks``,
-     popping every entry whose end-byte falls at or before
-     ``bytes_responded`` and calling
+  4. The ``resp_meth`` callback on a write beat advances
+     ``bytes_responded`` by ``req->get_size()`` and then walks
+     ``write_pending_acks``, popping every entry whose end-byte
+     falls at or before ``bytes_responded`` and calling
      ``be->ack_data(transfer, src_chunk_ptr, size)`` — i.e. the
      source only sees a chunk acknowledged after the
      corresponding write beats have really been responded to. When
@@ -321,11 +330,13 @@ upstream routers).
 Deny / retry
 ~~~~~~~~~~~~
 
-The adapter surfaces ``IO_REQ_DENIED`` directly: ``issue_beat``
-rolls back the slot's beat-pool cursor (writes) or simply doesn't
-mark the read as issued, sets ``denied_blocked = true`` and stops
-issuing. The downstream slave's ``retry()`` fires the adapter's
-``on_retry`` which clears ``denied_blocked`` and nudges the FSM.
+``IO_REQ_DENIED`` is surfaced directly to ``issue_beat``: it rolls
+back the slot's beat-pool cursor (writes) or simply doesn't mark
+the read as issued, sets ``denied_blocked = true`` and stops
+issuing. The downstream's ``retry()`` reaches the back-end's
+``retry_meth`` callback (forwarded through the auto-inserted
+adapter when present), which clears ``denied_blocked`` and nudges
+the FSM.
 
 Tests
 -----

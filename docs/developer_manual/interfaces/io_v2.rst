@@ -401,8 +401,8 @@ loop repeats until acceptance.
 
 .. code-block:: cpp
 
-    // Master side
-    static void on_retry(vp::Block *__this)
+    // Master side — the retry callback set on out's IoMaster ctor.
+    static void retry(vp::Block *__this)
     {
         auto *_this = (MyComp *)__this;
         if (_this->denied_req)
@@ -501,9 +501,13 @@ Diagrammatically, the three shapes look like this:
         ▼                                               ▼
 
 A master that needs uniform per-beat handling regardless of which
-form the slave picked can route the bus through a
-:doc:`BeatResponseAdapter <../components/ips/pulp/idma_v2>` — it
-collapses all three into a single ``on_beat`` callback stream.
+form the slave picked just declares its outbound binding with
+``signature=IoV2Beat(beat_width=W)``. The framework auto-inserts an
+``IoV2BeatAdapter`` between this master and any ``IoV2BigPacket`` /
+legacy-string ``'io_v2'`` slave; the master sees one normal
+``resp()`` per beat with ``size``/``data``/``is_first``/``is_last``/
+``burst_id``/``status`` mutated per beat. See
+`Beat-fidelity consumers`_.
 
 Write burst shapes
 ~~~~~~~~~~~~~~~~~~
@@ -632,10 +636,11 @@ required to set on the cumulative-final response):
 If the master *needs* a per-beat callback stream (e.g. a beat-rate
 DMA back-end that paces a downstream pipeline at one chunk per
 cycle), it should not implement this consumer logic by hand —
-route the bus master through a
-:class:`utils::BeatResponseAdapter`, which normalises whatever
-response form the slave produced into a uniform per-beat callback
-at cycle-accurate spacing. See `Beat-fidelity consumers`_.
+declare the outbound binding with
+``signature=IoV2Beat(beat_width=W)`` and the framework auto-inserts
+an ``IoV2BeatAdapter`` that normalises whatever response form the
+slave produced into a uniform per-beat ``resp()`` at cycle-accurate
+spacing. See `Beat-fidelity consumers`_.
 
 Latency annotation
 ------------------
@@ -645,7 +650,7 @@ transaction along the path from slave to master. Components that
 model timing inline — i.e. that return ``IO_REQ_DONE`` after a
 logical delay — add cycles to it before returning. The master
 reads it and stalls its own pipeline accordingly (the
-``BeatResponseAdapter``, for instance, spreads beats so the last
+``IoV2BeatAdapter``, for instance, spreads beats so the last
 one lands at ``now + latency``).
 
 For models that already use wall-clock scheduling (a
@@ -666,23 +671,65 @@ Beat-fidelity consumers
 -----------------------
 
 When a master wants to consume responses as a per-beat stream
-**regardless** of which of the three forms the slave chose, route
-the outgoing ``IoMaster`` through a ``BeatResponseAdapter``:
+**regardless** of which of the three forms the slave chose, declare
+the outbound binding with a class-based :class:`gvsoc.signature.IoV2Beat`
+signature. The framework's binding pass auto-inserts an
+``IoV2BeatAdapter`` between the master and the slave whenever the
+slave's signature is the legacy ``'io_v2'`` string or an explicit
+:class:`gvsoc.signature.IoV2BigPacket` — the master then sees a
+normal ``IoMaster``-shaped flow with one ``resp()`` per beat:
 
-- header: ``gvsoc/core/models/utils/io_v2_beat_adapter.hpp``
-- generic Block, instantiated as a member of the owning component,
-- ``submit()`` returns ``IO_REQ_GRANTED`` / ``IO_REQ_DENIED``
-  (never ``IO_REQ_DONE`` — inline DONE is converted into scheduled
-  per-beat callbacks),
-- the owning component implements a small ``Handler`` interface
-  (``on_beat`` + ``on_retry``).
+.. code-block:: python
 
-The adapter's header carries the "when to use it" rule — short
-version: you need it only if your component drives a per-beat
-downstream consumer at cycle-accurate spacing
-(``router_v2_beat`` and the iDMA's ``idma_be_axi`` are the
-existing users; see :doc:`../components/ips/pulp/idma_v2` for a
-worked example).
+    from gvsoc.signature import IoV2Beat
+
+    class MyDma(st.Component):
+        def o_AXI(self, slave_itf):
+            # Framework auto-inserts utils.io_v2_beat_adapter when the
+            # bound slave is IoV2BigPacket (or legacy 'io_v2').
+            self.itf_bind('axi', slave_itf,
+                          signature=IoV2Beat(beat_width=64))
+
+On the C++ side the master is a plain ``vp::IoMaster``; the
+``resp_meth`` is invoked once per beat with the per-beat fields
+mutated on the request:
+
+- ``req->size``, ``req->data`` — slice for this beat,
+- ``req->is_first`` / ``req->is_last`` — position in this
+  response stream,
+- ``req->burst_id`` — captured snapshot, stable across cascaded
+  beat-aware routers,
+- ``req->status`` — final status carried by every beat.
+
+Signature matrix and ``IoV2BeatAdapter`` insertion rule:
+
+==========================  ==================  ===============================
+master \\ slave              ``IoV2BigPacket``   ``IoV2Beat(W)``
+==========================  ==================  ===============================
+``IoV2BigPacket``            no adapter          no adapter (master tolerates beat-form responses)
+``IoV2Beat(W)``              **adapter inserted**  no adapter when widths match; error otherwise
+==========================  ==================  ===============================
+
+The adapter component is ``utils.io_v2_beat_adapter`` (source at
+``gvsoc/core/models/utils/io_v2_beat_adapter.{hpp,cpp}``). It appears
+in the tree under the name ``{master_comp}_{master_port}_bridge``,
+parented to the component owning the binding; the framework also
+clones the master's clock binding onto the bridge. Existing users
+that consume their bus via this mechanism are ``router_v2_beat``
+and the iDMA's ``idma_be_axi`` — see
+:doc:`../components/ips/pulp/idma_v2` for a worked example.
+
+Generic mechanism
+~~~~~~~~~~~~~~~~~
+
+``Signature.bridge_to(other_sig, parent, name)`` is the single hook
+the binding pass calls. Any future signature axis — clock-domain
+crossing, voltage-domain crossing, address-width adapter,
+endianness — adds a new ``Signature`` subclass with its own
+``is_compatible`` / ``bridge_to`` logic and the framework picks it
+up unchanged. The pass also lives in legacy ``gvsoc.systree`` (the
+gapy build-time path) so the generated ``tree.cpp`` and the
+runtime systree always agree.
 
 Multiplexed ports
 -----------------
@@ -758,8 +805,11 @@ See also
 - The header itself: ``gvsoc/engine/engine/include/vp/itf/io_v2.hpp``
   (the burst-conventions section at the top of the file is the
   authoritative source for the on-the-wire contract).
-- The reusable beat-response adapter:
-  ``gvsoc/core/models/utils/io_v2_beat_adapter.hpp`` (Block that
-  normalises any response form into a per-beat callback stream).
+- The framework-inserted beat-response adapter:
+  ``gvsoc/core/models/utils/io_v2_beat_adapter.{hpp,cpp}``
+  (standalone ``vp::Component`` named ``utils.io_v2_beat_adapter``;
+  auto-inserted by the binding pass on any io_v2 path whose master
+  declares ``signature=IoV2Beat(...)`` and whose slave is
+  ``IoV2BigPacket`` or the legacy ``'io_v2'`` string).
 - A worked end-to-end example using the v2 protocol with all
   three response forms: :doc:`../components/ips/pulp/idma_v2`.
