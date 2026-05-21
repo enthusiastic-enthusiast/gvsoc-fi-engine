@@ -140,7 +140,7 @@ class IoReq : public vp::QueueElem {
     void inc_latency(int64_t v) { this->latency += v; }
 
     // Reset per-send fields. Call before resubmitting a request object.
-    void prepare() { this->latency = 0; }
+    void prepare() { this->latency = 0; this->status = IO_RESP_OK; }
 
     uint64_t addr;
     uint8_t *data;
@@ -148,7 +148,11 @@ class IoReq : public vp::QueueElem {
     uint8_t *second_data;
     uint64_t size;
     IoReqOpcode opcode;
-    IoRespStatus status;
+    // Response status. Defaults to IO_RESP_OK; slaves only need to set it
+    // explicitly when reporting an error (IO_RESP_INVALID). prepare() also
+    // resets it to IO_RESP_OK so masters reusing a request object don't
+    // observe a stale error status from a previous send.
+    IoRespStatus status = IO_RESP_OK;
     bool is_first = true;
     bool is_last = true;
     int64_t burst_id = -1;

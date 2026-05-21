@@ -93,9 +93,12 @@ the bus. Fields a master or slave usually touches:
        ``MAXU``).
    * - ``status``
      - ``vp::IoRespStatus``
-     - Set by the slave on the response path:
-       ``IO_RESP_OK`` or ``IO_RESP_INVALID``. The master reads it
-       when ``IO_REQ_DONE`` or ``resp()`` fires.
+     - Response status the master reads when ``IO_REQ_DONE`` or
+       ``resp()`` fires. Defaults to ``IO_RESP_OK`` both at
+       construction and after ``prepare()``; the slave only needs
+       to call ``req->set_resp_status(IO_RESP_INVALID)`` to report
+       an error. Slaves are not required to set ``IO_RESP_OK``
+       explicitly on the success path.
    * - ``is_first``, ``is_last``
      - ``bool``
      - Burst markers. ``is_first = is_last = true`` for a
@@ -141,7 +144,7 @@ Ownership / mutation rules:
 
 A master reusing a request between sends should call
 ``req->prepare()`` to reset per-send fields (currently
-``latency = 0``).
+``latency = 0`` and ``status = IO_RESP_OK``).
 
 Ports
 -----
