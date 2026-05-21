@@ -83,11 +83,11 @@ namespace vp {
     protected:
         void reset(bool active) override;
     private:
-        T value;
-        T next_value;
-        T reset_value;
-        bool has_next_value_var;
-        int64_t next_value_clockstamp;
+        T value{};
+        T next_value{};
+        T reset_value{};
+        bool has_next_value_var = false;
+        int64_t next_value_clockstamp = 0;
     };
 };
 
