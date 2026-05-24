@@ -58,6 +58,21 @@ namespace vp {
             this->event.enable_set(true);
         }
 
+        // Attach a free-form description string that the trace engine will
+        // forward to the Vcd_user (via event_register) on enable(). Used by
+        // dumpers (fst_dumper, …) to ship out-of-band metadata (signal type,
+        // direction, …) that the Vcd_user interface doesn't model natively.
+        // The pointer must stay alive for the lifetime of the Event. No-op
+        // when the engine is built without CONFIG_GVSOC_EVENT_ACTIVE.
+        inline void description_set(const char *description)
+        {
+#ifdef CONFIG_GVSOC_EVENT_ACTIVE
+            this->event.description = description;
+#else
+            (void)description;
+#endif
+        }
+
     protected:
         virtual void reset(bool active) {};
 
