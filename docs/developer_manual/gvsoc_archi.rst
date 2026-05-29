@@ -28,6 +28,15 @@ GVSOC through this API to run, pause and resume it, based on buttons in the GUI.
 It is also possible to integrate GVSOC inside a bigger simulator, for example to integrate a GVSOC model
 into a bigger SystemC simulator.
 
+The SystemC integration lives entirely in the launcher/GUI entry points (``systemc_driver.cpp``),
+never in the GVSOC library or the models, and is guarded by ``VP_USE_SYSTEMC``. To avoid forcing a
+libsystemc runtime dependency on every run, the SystemC-capable binaries are built separately and only
+when ``$SYSTEMC_HOME`` is defined: the launchers ``gvsoc_launcher_sc`` / ``gvsoc_launcher_profile_sc`` /
+``gvsoc_launcher_debug_sc`` and the GUI ``gvsoc-gui3-sc``. The default ``gvsoc_launcher`` and
+``gvsoc-gui3`` stay SystemC-free. gvrun automatically selects the ``_sc`` variant for targets that
+require SystemC (``target/gvsoc/systemc``); when such a target runs, the engine is driven by the
+SystemC kernel instead of the internal engine thread.
+
 Inside the GVSOC library, the launcher module is in charge of implementing the API for the 2 available modes:
 
 * In the asynchronous mode, the engine is running in a dedicated thread. Several threads are allowed
@@ -125,14 +134,14 @@ Code organization
 |     ├── json.cpp
 |     ├── launcher.cpp
 |     ├── main.cpp
-|     ├── main_systemc.cpp
-|     ├── main_systemc.hpp
 |     ├── ports.cpp
 |     ├── proxy_client.cpp
 |     ├── proxy.cpp
 |     ├── queue.cpp
 |     ├── register.cpp
 |     ├── signal.cpp
+|     ├── systemc_driver.cpp
+|     ├── systemc_driver.hpp
 |     ├── top.cpp
 |     ├── time
 |     │   ├── block_time.cpp
