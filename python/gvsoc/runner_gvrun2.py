@@ -611,6 +611,10 @@ class Runner():
                     else:
                         launcher = gvsoc_config.get_str('launchers/default')
 
+                    # SystemC targets need the SystemC-linked launcher variant.
+                    if gvsoc_config.get_bool('systemc'):
+                        launcher = launcher + '_sc'
+
                     command = stub
 
                     command += [launcher, '--config=' + self.gvsoc_config_path]
