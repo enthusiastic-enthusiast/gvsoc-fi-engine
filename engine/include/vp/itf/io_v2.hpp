@@ -33,6 +33,16 @@
 //                         preserved across the beats. Final beat carries
 //                         is_last = true and the burst's final status.
 //
+//                         The slave MAY also mutate addr to carry the per-beat
+//                         start address (= burst_addr + cumulative emitted
+//                         bytes). This deviates from AXI — where one AxADDR
+//                         covers the whole burst and per-beat addresses are
+//                         implicit — but is a cheap convenience for tracing
+//                         and debugging on the master side, and the slave
+//                         already tracks the cumulative offset internally.
+//                         Masters MUST tolerate either convention: addr left
+//                         at burst_addr, or addr updated per beat.
+//
 // Reads vs writes (the AXI mental model):
 //
 //   - A read burst is always submitted as exactly one req() with
