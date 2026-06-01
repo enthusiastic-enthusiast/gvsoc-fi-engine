@@ -510,20 +510,6 @@ class Runner():
         return False
 
 
-    def __gen_debug_info(self, full_config, gvsoc_config):
-        debug_binaries_config = full_config.get('**/debug_binaries')
-        if debug_binaries_config is not None:
-            binaries_config = full_config.get('**/binaries')
-            if binaries_config is not None:
-                binaries = binaries_config.get_dict()
-                for index, binary in enumerate(debug_binaries_config.get_dict()):
-                    # Only generate debug symbols for small binaries, otherwise it is too slow
-                    # To allow it, the ISS should itself read the symbols.
-                    if os.path.getsize(binaries[index]) < 5 * 1024*1024:
-                        if os.system('gen-debug-info %s %s' % (binaries[index], binary)) != 0:
-                            print('Error while generating debug symbols information, make sure the toolchain and the binaries are accessible ')
-
-
     def run(self, norun=False, args=None):
 
         [args, otherArgs] = self.parser.parse_known_args()
@@ -541,8 +527,6 @@ class Runner():
                 _strip_tree_data(target_config)
 
         dump_config(self.full_config, gvrun.commands.get_abspath(args, self.gvsoc_config_path))
-
-        # self.__gen_debug_info(self.full_config, self.full_config.get('target/gvsoc'))
 
         if norun:
             return
