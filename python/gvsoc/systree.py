@@ -369,7 +369,7 @@ else:
             self.variant = name
 
         def itf_bind(self, master_itf_name: str, slave_itf: SlaveItf, signature: str=None,
-                composite_bind: bool=False):
+                composite_bind: bool=False, clock_bridge=None):
             """Bind to a slave interface.
 
             The specified master interface of this component is bound to the specified
@@ -413,10 +413,12 @@ else:
             # rewriting happens later in ``__build``.
             if composite_bind:
                 self.bind(self, master_itf_name, slave_itf.component, slave_itf.itf_name,
-                          master_signature=signature, slave_signature=slave_itf.signature)
+                          master_signature=signature, slave_signature=slave_itf.signature,
+                          clock_bridge=clock_bridge)
             else:
                 self.parent.bind(self, master_itf_name, slave_itf.component, slave_itf.itf_name,
-                                 master_signature=signature, slave_signature=slave_itf.signature)
+                                 master_signature=signature, slave_signature=slave_itf.signature,
+                                 clock_bridge=clock_bridge)
 
         def gen_stimuli(self):
             """Generate stimuli.
@@ -651,7 +653,7 @@ else:
 
 
         def bind(self, master: Component, master_itf: str, slave: Component, slave_itf: str, master_properties=None, slave_properties=None,
-                 master_signature=None, slave_signature=None):
+                 master_signature=None, slave_signature=None, clock_bridge=None):
             """Binds 2 components together.
 
             The binding can actually also involve 1 or 2 ports of the component to model bindings with something
@@ -671,9 +673,53 @@ else:
                 Optional class-based ``Signature`` instances stored on the
                 binding for the auto-bridge pass in ``__build``. Legacy
                 string signatures are passed through unchanged.
+            clock_bridge : str | tuple(str, dict) | None
+                Optional per-binding override of the CDC bridge kind for v2 IO
+                bindings that cross clock domains. ``None`` falls back to the
+                parent component's ``set_clock_bridge_policy`` and finally to
+                the ``'sync_only'`` default. See ``gvsoc.clock_bridges``.
             """
             self.bindings.append([master, master_itf, slave, slave_itf, master_properties, slave_properties,
-                                  master_signature, slave_signature])
+                                  master_signature, slave_signature, clock_bridge])
+
+        def set_clock_bridge_policy(self, src_clock, dst_clock, kind, opts=None):
+            """Declare which CDC bridge kind to insert between two clock sources.
+
+            Used by the v2 IO auto-bridge pass when a binding's master and
+            slave resolve to ``src_clock`` and ``dst_clock`` respectively and
+            no per-binding ``clock_bridge=`` override is set on the binding.
+            ``src_clock`` and ``dst_clock`` are the clock-source Components
+            (e.g. the ``ClockDomain`` instances returned by ``i_CLOCK()``
+            providers); identity is used for the lookup.
+            """
+            if not hasattr(self, '_clock_bridge_policy'):
+                self._clock_bridge_policy = {}
+            self._clock_bridge_policy[(id(src_clock), id(dst_clock))] = (kind, opts or {})
+
+        def get_clock_bridge_policy(self, src_clock, dst_clock):
+            """Look up a previously declared policy. Returns ``(kind, opts)`` or ``None``."""
+            policy = getattr(self, '_clock_bridge_policy', None)
+            if policy is None:
+                return None
+            return policy.get((id(src_clock), id(dst_clock)))
+
+        def _resolve_clock_source(self):
+            """Walk up the parent chain to find the (clock_source, port) bound
+            to this component's ``clock`` slave port.
+
+            Returns ``(clock_source_component, clock_port_name)`` or ``None``
+            if no clock binding has been declared anywhere up the chain.
+            """
+            comp = self
+            while comp is not None:
+                parent = getattr(comp, 'parent', None)
+                if parent is None or not hasattr(parent, 'bindings'):
+                    return None
+                for binding in parent.bindings:
+                    if binding[2] is comp and binding[3] == 'clock':
+                        return (binding[0], binding[1])
+                comp = parent
+            return None
 
         def slave_itf(self, name: str, signature: str):
             return SlaveItf(self, name, signature=signature)
@@ -967,7 +1013,8 @@ else:
             the engine falls back to the JSON-only path that cannot populate
             dataclass cfgs).
             """
-            from gvsoc.signature import Signature
+            from gvsoc.signature import Signature, IoV2BigPacket, IoV2Sync, IoV2Beat
+            from gvsoc import clock_bridges
             expanded = []
             clock_by_comp = {}
             for binding in self.bindings:
@@ -1000,7 +1047,58 @@ else:
                     new_clock_bindings.append([clock_src[0], clock_src[1], bridge, 'clock',
                                                None, None, None, None])
 
-            self.bindings = expanded + new_clock_bindings
+            # Clock-domain bridge pass — runs *after* the signature-bridge
+            # pass so that an inserted signature bridge (e.g. beat adapter)
+            # is splice-eligible too. For every IoV2 binding whose endpoints
+            # resolve to different clock sources, splice in the selected
+            # clock-bridge component (default 'sync_only').
+            _io_v2_sigs = (IoV2BigPacket, IoV2Sync, IoV2Beat)
+            after_clock = []
+            for binding in expanded:
+                master_sig = binding[6] if len(binding) > 6 else None
+                slave_sig = binding[7] if len(binding) > 7 else None
+                if not (isinstance(master_sig, _io_v2_sigs) and
+                        isinstance(slave_sig, _io_v2_sigs)):
+                    after_clock.append(binding)
+                    continue
+
+                master_comp = binding[0]
+                slave_comp = binding[2]
+                master_clock = master_comp._resolve_clock_source()
+                slave_clock = slave_comp._resolve_clock_source()
+                if master_clock is None or slave_clock is None:
+                    after_clock.append(binding)
+                    continue
+                if master_clock[0] is slave_clock[0]:
+                    after_clock.append(binding)
+                    continue
+
+                override = binding[8] if len(binding) > 8 else None
+                if override is not None:
+                    if isinstance(override, tuple):
+                        kind, opts = override
+                    else:
+                        kind, opts = override, {}
+                else:
+                    policy = self.get_clock_bridge_policy(master_clock[0], slave_clock[0])
+                    if policy is not None:
+                        kind, opts = policy
+                    else:
+                        kind, opts = 'sync_only', {}
+
+                bridge_name = f'{binding[0].name}_{binding[1]}_clkbridge'
+                bridge = clock_bridges.make(kind, parent=self, name=bridge_name, **opts)
+
+                after_clock.append([binding[0], binding[1], bridge, 'input',
+                                    binding[4], None,
+                                    master_sig, master_sig])
+                after_clock.append([bridge, 'output', binding[2], binding[3],
+                                    None, binding[5],
+                                    slave_sig, slave_sig])
+                new_clock_bindings.append([master_clock[0], master_clock[1], bridge, 'clock',
+                                           None, None, None, None])
+
+            self.bindings = after_clock + new_clock_bindings
 
         def finalize(self):
             pass
