@@ -32,8 +32,9 @@ namespace gv {
      * working need not bump it (bumping is always safe — it just forces a rebuild).
      *
      * v1 == trace declare/subscribe protocol (event_declare / event_subscribe).
+     * v2 == ComponentTreeNode carries TreeMapping address maps (layout change).
      */
-    #define GV_API_VERSION 1
+    #define GV_API_VERSION 2
 
     /**
      * Return the GV_API_VERSION the engine was built with.

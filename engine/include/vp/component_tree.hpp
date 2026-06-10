@@ -63,6 +63,20 @@ struct RuntimeField
 };
 
 /**
+ * @brief One address-range mapping of an interconnect component.
+ *
+ * Generated from config fields named ``mappings`` whose entries carry
+ * name/base/size. Purely informational for tools (the models read their
+ * typed configs directly); exported so the GUI can display memory maps.
+ */
+struct TreeMapping
+{
+    const char *name;           // Target port name
+    uint64_t base;              // Base address
+    uint64_t size;              // Range size in bytes (0: catch-all)
+};
+
+/**
  * @brief Node in the compiled component tree.
  *
  * Generated per-target by Python. Describes the hierarchy of components
@@ -80,6 +94,8 @@ struct ComponentTreeNode
     int num_bindings;                    // Number of bindings
     const RuntimeField *runtime_fields;  // Runtime-settable field table, or nullptr
     int num_runtime_fields;              // Number of runtime-settable fields
+    const TreeMapping *mappings;         // Address mappings (interconnects), or nullptr
+    int num_mappings;                    // Number of address mappings
 
     /**
      * @brief Find a child node by name.
