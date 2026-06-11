@@ -103,6 +103,8 @@ bool vp::Event::dump_next_values()
     if (this->next_value_cyclestamp <= this->parent.clock.get_cycles())
     {
         this->has_next_value = false;
+        this->has_value = true;
+        this->is_highz = this->next_is_highz;
         EventDumpCallback callback = (EventDumpCallback)this->dump_callback;
 
         if (callback)
@@ -466,10 +468,19 @@ void vp::Event::enable_set(bool enabled, vp::Event_file *file)
         // Replay the owner's current value to this freshly-enabled subscriber.
         // The value may have last been set before the subscription (e.g. a
         // clock period dumped once at reset); without this the late subscriber
-        // would see no value at all. dump_value() emits at the current time.
-        if (this->enable_value != NULL && this->has_value)
+        // would see no value at all. dump_value()/dump_highz() emit at the
+        // current time. A signal currently in high-Z (e.g. reset to high-Z
+        // before the GUI subscribed) replays Z, not its stale value bytes.
+        if (this->has_value)
         {
-            this->dump_value(this->enable_value);
+            if (this->is_highz)
+            {
+                this->dump_highz();
+            }
+            else if (this->enable_value != NULL)
+            {
+                this->dump_value(this->enable_value);
+            }
         }
     }
     else
@@ -487,6 +498,7 @@ void vp::Event::dump_highz_next()
         // (flag=1, value=1) per bit. Set both to all-1s.
         uint64_t highz = (uint64_t)-1;
         this->next_value_fill_callback(this, (uint8_t *)&highz, (uint8_t *)&highz);
+        this->next_is_highz = true;
 
         if (!this->has_next_value || cycles < this->next_value_cyclestamp)
         {
@@ -509,6 +521,7 @@ void vp::Event::dump_next(uint8_t *value, int64_t cycles, int64_t time_delay)
         uint64_t value = 0;
         uint64_t flags = 0;
         this->next_value_fill_callback(this, (uint8_t *)&value, (uint8_t *)&flags);
+        this->next_is_highz = false;
 
         if (!this->has_next_value || cycles < this->next_value_cyclestamp)
         {

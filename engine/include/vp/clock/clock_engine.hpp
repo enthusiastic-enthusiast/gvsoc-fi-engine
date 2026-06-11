@@ -254,6 +254,13 @@ namespace vp
         // List of traces to be flushed when next cycle starts. This is mostly used to allow models
         // to enqueue next trace value for automatic release.
         vp::Event *trace_flush_head = NULL;
+        // Dummy event enqueued at a deferred trace value's cyclestamp so the
+        // engine really executes (and dump_traces flushes) at that cycle. On a
+        // sparse clock (no permanent event) the engine would otherwise jump
+        // straight to its next delayed event and dump the deferred value late
+        // (e.g. a signal set_and_release would only float at the next access).
+        static void trace_flush_handler(vp::Block *_this, vp::ClockEvent *event);
+        vp::ClockEvent trace_flush_event;
         #endif
     };
 

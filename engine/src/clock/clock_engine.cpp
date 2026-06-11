@@ -380,6 +380,7 @@ void vp::ClockEngine::dump_traces()
     // flush them and clear the list
     vp::Event *event = this->trace_flush_head;
     this->trace_flush_head = NULL;
+    uint64_t min_cyclestamp = UINT64_MAX;
     while (event)
     {
         vp::Event *next = event->next_get();
@@ -387,11 +388,37 @@ void vp::ClockEngine::dump_traces()
         {
             event->next_set(this->trace_flush_head);
             this->trace_flush_head = event;
+            if ((uint64_t)event->next_value_cyclestamp_get() < min_cyclestamp)
+            {
+                min_cyclestamp = event->next_value_cyclestamp_get();
+            }
         }
         event = next;
     }
+
+    // Some deferred values are still pending (future cyclestamp): keep the
+    // flush event armed so the engine really executes at that cycle (a sparse
+    // clock would otherwise jump past it and dump them late).
+    if (this->trace_flush_head != NULL && this->period != 0)
+    {
+        int64_t cycles = (int64_t)(min_cyclestamp - this->get_cycles());
+        if (cycles < 1)
+        {
+            cycles = 1;
+        }
+        this->enqueue(&this->trace_flush_event, cycles);
+    }
 #endif
 }
+
+#ifdef CONFIG_GVSOC_EVENT_ACTIVE
+void vp::ClockEngine::trace_flush_handler(vp::Block *__this, vp::ClockEvent *event)
+{
+    // Nothing to do: the event only forces the engine to execute at the
+    // deferred trace values' cyclestamp; dump_traces(), called at the start of
+    // the cycle, does the actual flush.
+}
+#endif
 
 int64_t vp::ClockEngine::exec()
 {
@@ -558,6 +585,9 @@ vp::ClockEngine::ClockEngine(vp::ComponentConf &config)
 : vp::Component(config), clock_trace(*this, "period", 64, false),
     cycles(0), period(0), freq(0),
     apply_frequency_event(this, &vp::ClockEngine::apply_frequency_handler)
+#ifdef CONFIG_GVSOC_EVENT_ACTIVE
+    , trace_flush_event(this, &vp::ClockEngine::trace_flush_handler)
+#endif
 {
     this->time_engine = config.time_engine;
     this->time_engine->register_clock_engine(this);
