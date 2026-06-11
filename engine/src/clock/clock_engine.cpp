@@ -283,7 +283,18 @@ vp::ClockEvent *vp::ClockEngine::enqueue(vp::ClockEvent *event, int64_t cycle)
     {
         if (this->period != 0 && !this->permanent_first)
         {
-            time.enqueue_to_engine(this->stop_time + cycle * period);
+            // The enqueue may come inline from another clock domain in the
+            // middle of one of our cycles (stop_time is the last whole-cycle
+            // boundary, which can be in the past): align the wake-up on the
+            // next edge at or after the current time, as the hardware would
+            // sample the request on the next edge of this clock.
+            int64_t full_time = this->stop_time + cycle * period;
+            int64_t now = this->time.get_time();
+            if (unlikely(full_time < now))
+            {
+                full_time += (now - full_time + period - 1) / period * period;
+            }
+            time.enqueue_to_engine(full_time);
         }
     }
 

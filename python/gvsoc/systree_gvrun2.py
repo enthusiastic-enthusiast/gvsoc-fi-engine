@@ -953,12 +953,18 @@ class Component(gvrun.target.SystemTreeNode):
         # splice in the selected clock-bridge component (default
         # 'sync_only', matching v1's transparent auto-crossing).
         _io_v2_sigs = (IoV2BigPacket, IoV2Sync, IoV2Beat)
+
+        def _is_io_v2_sig(sig):
+            # Class-based v2 signatures, plus the legacy 'io_v2' string,
+            # which is the historic big-packet default (see gvsoc.signature)
+            # and must get the same auto-crossing treatment.
+            return isinstance(sig, _io_v2_sigs) or sig == IoV2BigPacket.tag
+
         after_clock = []
         for binding in expanded:
             master_sig = binding[6] if len(binding) > 6 else None
             slave_sig = binding[7] if len(binding) > 7 else None
-            if not (isinstance(master_sig, _io_v2_sigs) and
-                    isinstance(slave_sig, _io_v2_sigs)):
+            if not (_is_io_v2_sig(master_sig) and _is_io_v2_sig(slave_sig)):
                 after_clock.append(binding)
                 continue
 
