@@ -633,7 +633,9 @@ class Runner():
 
                     self.full_config.set('target/gvsoc/proxy/port', port)
                     self.full_config.set('target/gvsoc/proxy/enabled', True)
-                    dump_config(self.full_config, gvrun.commands.get_abspath(args, self.gvsoc_config_path))
+                    # The current directory is already the work dir, resolving the config
+                    # path against args.work_dir again would break with a relative work dir
+                    dump_config(self.full_config, self.gvsoc_config_path)
 
                     run = pexpect.spawn(' '.join(command), encoding='utf-8', logfile=sys.stdout,
                         codec_errors='replace')
