@@ -22,6 +22,7 @@ For guidance on model development, please refer to the developer documentation.
    target_control
    system_traces
    devices/index.rst
+   targets/index.rst
 
 
 .. toctree::
