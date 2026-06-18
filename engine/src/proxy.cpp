@@ -57,7 +57,8 @@ static std::vector<std::string> split(const std::string& s, char delimiter)
 
 
 gv::GvProxy::GvProxy(vp::TimeEngine *engine, vp::Component *top, int req_pipe, int reply_pipe)
-  : top(top), req_pipe(req_pipe), reply_pipe(reply_pipe), logger("PROXY")
+  : top(top), req_pipe(req_pipe), reply_pipe(reply_pipe),
+    logger("PROXY")
 {
     this->logger.info("Instantiating proxy\n");
 }
@@ -72,6 +73,8 @@ void gv::GvProxy::listener(void)
         if ((client_fd = accept(this->telnet_socket, NULL, NULL)) == -1)
         {
             if(errno == EAGAIN) continue;
+            // Expected when stop() closed the listening socket to break us out of accept().
+            if (this->stopping) return;
             fprintf(stderr, "Failed to accept connection: %s\n", strerror(errno));
             return;
         }
@@ -184,6 +187,66 @@ void gv::GvProxy::send_quit(int status)
     }
 }
 
+void gv::GvProxySession::notify(const std::string &msg)
+{
+    dprintf(this->reply_fd, "%s", msg.c_str());
+}
+
+void gv::GvProxySession::send_step_reply()
+{
+    // Caller must hold proxy->mutex. Flush trace output so it is available before the reply.
+    fflush(stdout);
+    dprintf(this->reply_fd, "req=%s;msg=%ld\n", this->step_req.c_str(),
+        gv::Controller::get().top_get()->get_time_engine()->get_time());
+}
+
+void gv::GvProxy::step_end(void *data)
+{
+    // The step data is the issuing session (set by the session's step command). Match it against
+    // our live sessions before using it, so a step issued by a non-proxy client (whose data is
+    // something else entirely) is ignored rather than mis-cast.
+    std::unique_lock<std::mutex> lock(this->mutex);
+    for (auto session: this->sessions)
+    {
+        if ((void *)session == data)
+        {
+            session->send_step_reply();
+            return;
+        }
+    }
+}
+
+void gv::GvProxy::notify_running()
+{
+    std::unique_lock<std::mutex> lock(this->mutex);
+    // Uses the run-state notification format the proxy clients already understand (gvsoc_control
+    // parses msg=running=1 / msg=stopped=<time> to track run-state).
+    for (auto session: this->sessions)
+    {
+        session->notify("req=-1;msg=running=1\n");
+    }
+}
+
+void gv::GvProxy::notify_stopped()
+{
+    std::unique_lock<std::mutex> lock(this->mutex);
+    int64_t time = gv::Controller::get().top_get()->get_time_engine()->get_time();
+    std::string msg = "req=-1;msg=stopped=" + std::to_string(time) + "\n";
+    for (auto session: this->sessions)
+    {
+        session->notify(msg);
+    }
+}
+
+void gv::GvProxy::notify_syscall_stop()
+{
+    std::unique_lock<std::mutex> lock(this->mutex);
+    for (auto session: this->sessions)
+    {
+        session->notify("req=-1;msg=syscall_stop\n");
+    }
+}
+
 
 void gv::GvProxy::send_reply(std::string msg)
 {
@@ -216,8 +279,11 @@ gv::GvProxySession::GvProxySession(GvProxy *proxy, int req_fd, int reply_fd)
 : logger("PROXY_SESSION(" + std::to_string(req_fd) + ")"), proxy(proxy),
     socket_fd(req_fd), reply_fd(reply_fd)
 {
+    // Each session owns a control client: a gating client distinct from the always-on host (the
+    // GUI's database client driving the engine through the gvsoc API, or the standalone main.cpp
+    // client). It does not bind a Gvsoc_user — engine events arrive as wire notifications pushed by
+    // the controller (step_end / notify_running / notify_stopped / notify_syscall_stop).
     this->gvsoc = gvsoc_new(NULL, "PROXY_SESSION(" + std::to_string(req_fd) + ")");
-    this->gvsoc->bind(this);
     this->loop_thread = new std::thread(&gv::GvProxySession::proxy_loop, this);
 }
 
@@ -227,15 +293,50 @@ void gv::GvProxySession::wait()
     this->loop_thread->join();
 }
 
+void gv::GvProxy::stop()
+{
+    this->stopping = true;
+
+    // Stop accepting connections: closing the listening socket breaks the listener's accept().
+    if (this->telnet_socket >= 0)
+    {
+        ::shutdown(this->telnet_socket, SHUT_RDWR);
+        ::close(this->telnet_socket);
+        this->telnet_socket = -1;
+    }
+    if (this->listener_thread)
+    {
+        this->listener_thread->join();
+        delete this->listener_thread;
+        this->listener_thread = nullptr;
+    }
+
+    // Force any session blocked in fgets() to return (EOF) so its thread exits and releases the
+    // FILE lock; then join it.
+    {
+        std::unique_lock<std::mutex> lock(this->mutex);
+        for (int fd : this->sockets)
+        {
+            ::shutdown(fd, SHUT_RDWR);
+        }
+    }
+    for (GvProxySession *session : this->sessions)
+    {
+        session->wait();
+    }
+}
+
 void gv::GvProxySession::proxy_loop()
 {
     FILE *sock = fdopen(socket_fd, "r");
     FILE *reply_sock = fdopen(reply_fd, "w");
     gv::Controller &controller = gv::Controller::get();
-    vp::TimeEngine *engine = controller.top_get()->get_time_engine();
 
     while(1)
     {
+        // Re-fetch each iteration so commands track the current system, which may have been
+        // rebuilt by a restart (the old engine pointer would otherwise be stale).
+        vp::TimeEngine *engine = controller.top_get()->get_time_engine();
         std::string line;
 
         char buffer[1024];
@@ -308,8 +409,11 @@ void gv::GvProxySession::proxy_loop()
                 else
                 {
                     int64_t duration = strtol(words[1].c_str(), NULL, 0);
-                    int64_t timestamp = engine->get_time() + duration;
-                    this->gvsoc->step(duration, false, (void *)atoll(req.c_str()));
+                    // Step asynchronously, passing this session as the step data; the controller
+                    // routes the step-end back to it through GvProxy::step_end, which sends the
+                    // reply (see step_async_handler).
+                    this->step_req = req;
+                    this->gvsoc->step(duration, false, (void *)this);
                 }
             }
             else if (words[0] == "step_cycles")
@@ -487,26 +591,3 @@ void gv::GvProxySession::proxy_loop()
 }
 
 
-void gv::GvProxySession::handle_step_end(void *request)
-{
-    // Flush trace output so it is available before the reply reaches the client
-    fflush(stdout);
-
-    std::unique_lock<std::mutex> lock(this->proxy->mutex);
-    dprintf(reply_fd, "req=%lld;msg=%ld\n", (long long)request,
-        gv::Controller::get().top_get()->get_time_engine()->get_time());
-    lock.unlock();
-}
-
-void gv::GvProxySession::handle_syscall_stop()
-{
-    gv::Controller::get().stop((ControllerClient *)this->gvsoc);
-    std::unique_lock<std::mutex> lock(this->proxy->mutex);
-    dprintf(this->reply_fd, "req=-1;msg=syscall_stop\n");
-    lock.unlock();
-}
-
-void gv::GvProxySession::has_ended(int status)
-{
-    this->proxy->send_quit(status);
-}

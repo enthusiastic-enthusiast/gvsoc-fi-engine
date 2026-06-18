@@ -103,6 +103,14 @@ void gv::Controller::syscall_stop_handle()
             client->user->handle_syscall_stop();
         }
     }
+
+    // Proxy clients are not Gvsoc_users: pause the engine (the last-added client is the proxy's
+    // gating one) and push the stop to them over the wire.
+    if (this->proxy && !this->clients.empty())
+    {
+        this->stop(this->clients.back());
+        this->proxy->notify_syscall_stop();
+    }
 }
 
 void gv::Controller::init(gv::GvsocConf *conf)
@@ -137,11 +145,22 @@ void gv::Controller::init(gv::GvsocConf *conf)
             this->systemc_enabled = gv_config->get_child_bool("systemc");
 
             this->proxy = NULL;
-            if (gv_config->get_child_bool("proxy/enabled"))
+            // The proxy is enabled either through the platform config ("proxy/enabled") or
+            // programmatically through GvsocConf (an in-process host, e.g. the GUI). Each session
+            // owns a control client that gates the engine against the always-on host (the GUI's
+            // database client driving the engine through the gvsoc API, or the standalone main.cpp
+            // client).
+            bool conf_proxy = this->conf && this->conf->proxy_enabled;
+            if (gv_config->get_child_bool("proxy/enabled") || conf_proxy)
             {
-                int in_port = gv_config->get_child_int("proxy/port");
+                // A programmatic in-process host (e.g. the GUI, via GvsocConf) always wants an
+                // ephemeral port and no startup wait (the console is an optional panel opened on
+                // demand). A config-enabled (standalone) proxy waits for a connection and takes its
+                // listening port from the config.
+                int in_port = conf_proxy ? 0 : gv_config->get_child_int("proxy/port");
+                this->proxy_wait = !conf_proxy;
                 int out_port;
-                this->proxy = new GvProxy(this->handler->get_time_engine(), instance);
+                this->proxy = new GvProxy(this->handler->get_time_engine(), instance, -1, -1);
 
                 if (this->proxy->open(in_port, &out_port))
                 {
@@ -205,8 +224,9 @@ void gv::Controller::start(ControllerClient *client)
     this->instance->reset_all(false);
 
     // Now that all initialization are done, wait for at least one proxy connection before
-    // running.
-    if (this->proxy)
+    // running. Skipped for an in-process host (proxy_wait false), where the console is an optional
+    // panel opened on demand and must not block engine startup.
+    if (this->proxy && this->proxy_wait)
     {
         this->proxy->wait_connected();
     }
@@ -226,6 +246,13 @@ void gv::Controller::start(ControllerClient *client)
 
 void gv::Controller::close(ControllerClient *client)
 {
+    // Tear down the proxy first so no session thread is left blocked reading its socket: such a
+    // thread holds a stdio FILE lock that would deadlock the stdio cleanup run at process exit.
+    if (this->proxy)
+    {
+        this->proxy->stop();
+    }
+
     ((vp::Top *)this->handler)->get_trace_engine()->flush();
 
     this->instance->stop_all();
@@ -246,13 +273,12 @@ void gv::Controller::close(ControllerClient *client)
 
 void gv::Controller::restart(ControllerClient *client)
 {
-    // Restart is not supported when the engine is driven by an external SystemC kernel
-    // since SystemC time cannot be rewound in-process, nor when the proxy is enabled
-    // since it keeps references to the system being destroyed.
-    if (this->systemc_enabled || this->proxy)
+    // Restart is not supported when the engine is driven by an external SystemC kernel since
+    // SystemC time cannot be rewound in-process. The proxy is supported: it only keeps a pointer
+    // to the system (repointed below) and its sessions re-fetch the engine each command.
+    if (this->systemc_enabled)
     {
-        fprintf(stderr, "Ignoring restart request, it is not supported %s\n",
-            this->systemc_enabled ? "on SystemC platforms" : "when the proxy is enabled");
+        fprintf(stderr, "Ignoring restart request, it is not supported on SystemC platforms\n");
         return;
     }
 
@@ -291,11 +317,28 @@ void gv::Controller::restart(ControllerClient *client)
     this->retval = -1;
     this->clients_want_run_prev = false;
 
+    // A restarted system is paused at time 0: drop every client's run request so nothing resumes on
+    // its own. The always-on host re-runs explicitly after restart (the GUI calls run() again); a
+    // proxy session (e.g. the console) stays parked until it issues run. Without this, a client that
+    // was running before the restart would keep the engine advancing immediately after rebuild.
+    this->run_count = 0;
+    for (ControllerClient *current: this->clients)
+    {
+        current->running = false;
+    }
+
     // Rebuild, mirroring init(), open() and start(). The engine and sigint threads are
     // not recreated, they stay around and dereference the new handler once resumed.
     this->handler = new vp::Top(this->config_path, this->is_async, this);
     this->instance = this->handler->top_instance;
     this->instance->set_launcher(this);
+
+    // The proxy holds a pointer to the system being destroyed; repoint it at the rebuilt one so
+    // proxy sessions (e.g. the GUI console) keep working across the restart.
+    if (this->proxy)
+    {
+        this->proxy->top = this->instance;
+    }
 
     this->step_block = new vp::Block(NULL, "stepper", this->handler->get_time_engine(),
         this->handler->get_trace_engine(), this->handler->get_power_engine());
@@ -415,6 +458,12 @@ void gv::Controller::sim_finished(int status)
             client->sim_finished(status);
         }
 
+        // Proxy clients (e.g. gvconsole) are not Gvsoc_users; push the exit to them over the wire.
+        if (this->proxy)
+        {
+            this->proxy->send_quit(status);
+        }
+
         pthread_cond_broadcast(&this->cond);
     }
 }
@@ -505,6 +554,13 @@ void gv::Controller::step_async_handler(vp::Block *__this, vp::TimeEvent *event)
         }
     }
 
+    // For a shared proxy session (no client user of its own), the step data is the session; route
+    // the step-end reply to it. No-op unless the proxy shares the host client.
+    if (_this->proxy)
+    {
+        _this->proxy->step_end(event->get_args()[2]);
+    }
+
     delete event;
 }
 
@@ -576,10 +632,8 @@ bool gv::Controller::is_runnable()
 void gv::Controller::check_run()
 {
     pthread_mutex_lock(&this->lock_mutex);
-    // Simulation can run if all clients are runnable and no one locked the engine, except once
-    // the simulation is finished, anyone can run it.
-    bool should_run = (this->run_count == this->clients.size() && this->lock_count == 0) ||
-        (this->is_sim_finished && this->run_count > 0);
+    // Simulation can run if all clients are runnable and no one locked the engine.
+    bool should_run = this->run_count == this->clients.size() && this->lock_count == 0;
 
     // Detect the genuine "all clients want to run" -> "paused" transition so we can notify
     // clients with has_stopped(). We key on run_count (the persistent run/stop state) rather
@@ -591,6 +645,8 @@ void gv::Controller::check_run()
     bool clients_want_run = this->clients.size() > 0 &&
         this->run_count == this->clients.size();
     bool notify_stopped = this->clients_want_run_prev && !clients_want_run;
+    // Symmetric paused->running edge, used to push a run notification over the proxy.
+    bool notify_running = !this->clients_want_run_prev && clients_want_run;
     this->clients_want_run_prev = clients_want_run;
 
     this->logger.info("Checking engine (should_run: %d, running: %d, run_count: %d, nb_clients: %d,"
@@ -622,6 +678,15 @@ void gv::Controller::check_run()
     if (notify_stopped)
     {
         this->sim_stopped();
+    }
+
+    // Push run-state changes over the proxy so connected front-ends (GUI button, console prompt)
+    // stay in sync regardless of which one drove the engine. No-op unless the proxy shares the
+    // host client (see GvProxy::notify_*).
+    if (this->proxy)
+    {
+        if (notify_running) this->proxy->notify_running();
+        if (notify_stopped) this->proxy->notify_stopped();
     }
 }
 

@@ -199,6 +199,10 @@ namespace gv {
         vp::Component *instance;
         // Proxy
         GvProxy *proxy;
+        // When a proxy is enabled, tells whether start() must block until a client connects. True
+        // for a config-enabled (standalone) proxy; false for an in-process host (the GUI) so the
+        // engine can start without an attached console.
+        bool proxy_wait = true;
         // Tell if time engine should be running. In asynchronous mode, there might be a delay
         // with the actual state of the engine
         bool running = false;
