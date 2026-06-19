@@ -309,6 +309,7 @@ bool vp::RegisterCommon::access_callback(uint64_t reg_offset, int size, uint8_t 
 
 
 vp::RegisterCommon::RegisterCommon(Block &parent, std::string name, int width, bool do_reset)
+: reg_event(parent, name.c_str(), width)
 {
     parent.add_register(this);
     this->width = width;
@@ -316,11 +317,13 @@ vp::RegisterCommon::RegisterCommon(Block &parent, std::string name, int width, b
     this->name = name;
     this->nb_bytes = (width + 7) / 8;
     parent.traces.new_trace(name + "/trace", &this->trace, vp::TRACE);
-    parent.traces.new_trace_event(name, &this->reg_event, width);
     // Hand the register event a stable pointer to our field layout. The vector
     // is still empty here (the generated derived ctor fills it after us); it is
-    // serialized lazily when the trace is enabled/declared.
+    // serialized lazily into the event description when enabled/declared.
     this->reg_event.regfields = &this->regfields;
+    // Likewise expose the register offset (set by the generated ctor after us)
+    // so the GUI can order registers by address. &this->offset is stable.
+    this->reg_event.reg_offset = &this->offset;
 }
 
 
