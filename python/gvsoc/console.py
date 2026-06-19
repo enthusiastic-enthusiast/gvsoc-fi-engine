@@ -121,6 +121,8 @@ class GvsocConsole(cmd.Cmd):
         self.sym_addrs = []  # sorted list of (addr, name) for reverse lookup
         self.trace_file = None  # path to trace output file
         self.trace_file_pos = 0  # current read position
+        self.gui_embedded = False  # True when launched behind the GUI relay (sync clock selection)
+        self._applied_clock_seq = 0  # reader sequence of the last GUI clock selection we applied
         self._update_prompt()
 
     def preloop(self):
@@ -158,8 +160,37 @@ class GvsocConsole(cmd.Cmd):
     def precmd(self, line):
         """Drain notification queue and update prompt before each command."""
         self._drain_notifications()
+        self._sync_clock_from_gui()
         self._update_prompt()
         return line
+
+    def _notify_clock_selection(self, path):
+        """Mirror a console-originated clock selection to the GUI timeline icon.
+
+        Only when embedded in the GUI: the relay intercepts this line and never forwards it to the
+        engine, so it is fire-and-forget (no reply to wait for). Selections coming FROM the GUI are
+        applied via _sync_clock_from_gui and never reach here, so there is no feedback loop.
+        """
+        if not self.gui_embedded or not path or self.proxy is None:
+            return
+        try:
+            self.proxy._send_cmd('clock_select %s' % path, wait_reply=False)
+        except Exception:
+            pass
+
+    def _sync_clock_from_gui(self):
+        """Adopt a clock-domain selection pushed from the GUI (icon / signal right-click).
+
+        The reader stamps each inbound notification with an incrementing sequence so a re-selection of
+        the same domain is still seen. Applied locally only (used by 'stepc'/'clock info'); not echoed.
+        """
+        reader = self.proxy.reader if self.proxy else None
+        if reader is None:
+            return
+        seq = getattr(reader, 'active_clock_seq', 0)
+        if seq != self._applied_clock_seq:
+            self._applied_clock_seq = seq
+            self.clock_domain = getattr(reader, 'active_clock', None)
 
     def postcmd(self, stop, line):
         """Update prompt after each command."""
@@ -392,6 +423,7 @@ class GvsocConsole(cmd.Cmd):
                 print(f"Error: clock domain '{path}' not found. Use 'clock list' to see available domains.")
                 return
             self.clock_domain = found['path']
+            self._notify_clock_selection(self.clock_domain)
             print(f"Selected clock domain: {self.clock_domain}")
             print(f"  Frequency: {found.get('frequency', 0)} Hz")
             print(f"  Period:    {found.get('period', 0)} ps")
@@ -1346,9 +1378,13 @@ def main():
                         help="Execute commands from file then exit")
     parser.add_argument("--tracefile", default=None,
                         help="Trace output file to monitor for inline display")
+    parser.add_argument("--gui-embedded", dest="gui_embedded", action="store_true",
+                        help="Console runs behind the GUI proxy relay; relay clock-domain selections "
+                             "to the timeline icon")
     args = parser.parse_args()
 
     console = GvsocConsole(args.host, args.port)
+    console.gui_embedded = args.gui_embedded
     if args.tracefile:
         console.trace_file = os.path.expanduser(args.tracefile)
         console.trace_file_pos = os.path.getsize(console.trace_file) if os.path.exists(console.trace_file) else 0

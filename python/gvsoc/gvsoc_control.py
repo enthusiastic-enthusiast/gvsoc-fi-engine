@@ -48,6 +48,10 @@ class Proxy(object):
             self.sim_has_exited = False
             self.sim_exit_code = -1
             self.syscall_stop = False
+            # Active clock-domain path pushed by the GUI relay (clock_selected notification), with an
+            # incrementing sequence so the console can detect re-selection of the same domain.
+            self.active_clock = None
+            self.active_clock_seq = 0
 
         def __quit(self, status):
             self.lock.acquire()
@@ -99,6 +103,12 @@ class Proxy(object):
                             is_stop = int(value.split('=')[1])
                         elif msg.find('running') == 0:
                             is_run = int(value.split('=')[1])
+                        elif msg.find('clock_selected=') == 0:
+                            # GUI relay announcing the active clock domain (see ProxyRelay
+                            # notify_clock_selected). Stamp it with a sequence so the console picks it
+                            # up even when the same domain is re-selected.
+                            self.active_clock = msg.split('=', 1)[1]
+                            self.active_clock_seq += 1
 
                     elif name == 'err':
                         err = value
