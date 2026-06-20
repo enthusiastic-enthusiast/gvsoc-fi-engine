@@ -75,9 +75,12 @@ class Proxy(object):
                         # if not byte:
                         #     self.__quit(-1)
                         #     return
-                        reply += byte
+                        # Stop at the line terminator without keeping it: it is not part of any
+                        # field value. Otherwise the last field (e.g. the clock_selected= path)
+                        # carries a trailing '\n' and string comparisons against it fail.
                         if byte == '\n':
                             break
+                        reply += byte
                 except:
                     # self.__quit(-1)
                     return
