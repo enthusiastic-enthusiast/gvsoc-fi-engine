@@ -35,6 +35,16 @@ namespace gv {
 
     extern gv::Controller controller;
 
+    // Context carried into ClockEngine::step_cycles' C-style callback (void(*)(void*)), which cannot
+    // use TimeEvent::get_args() like the time-step path. Heap-allocated by step_cycles_async and
+    // freed by step_cycles_async_handler.
+    struct StepCyclesReq
+    {
+        Controller *controller;
+        ControllerClient *client;
+        void *request;
+    };
+
     class Logger
     {
     public:
@@ -100,6 +110,10 @@ namespace gv {
         void step_sync(int64_t duration, ControllerClient *client);
         // Run simulation for specified duration in asynchronous mode
         void step_async(int64_t duration, ControllerClient *client, bool wait, void *request);
+        // Step a clock domain by exactly count cycles in asynchronous mode, using a clock event
+        // enqueued in the domain itself (cycle-accurate, immune to frequency changes).
+        void step_cycles_async(int clock_id, int64_t count, ControllerClient *client, bool wait,
+            void *request);
         // Run simulation until specified timestamp is reached, in synchronous mode
         void step_until_sync(int64_t timestamp, ControllerClient *client);
         // Run simulation until specified timestamp is reached, in asynchronous mode
@@ -163,6 +177,9 @@ namespace gv {
         // Static handler used as time event callback, used to stop engine when a step is reached,
         // for synchronous mode
         static void step_sync_handler(vp::Block *__this, vp::TimeEvent *event);
+        // Static handler invoked by ClockEngine::step_cycles when the requested cycle count is
+        // reached. Mirrors step_async_handler: stops the client and routes the step-end reply.
+        static void step_cycles_async_handler(void *arg);
         // Allocate and setup the preallocated synchronous step event of a client.
         // Used when the client registers and again on restart, since step events are
         // attached to the step block of the current system.
@@ -253,6 +270,9 @@ namespace gv {
         void report_stop() override;
         gv::PowerReport *report_get() override;
         void step(int64_t duration, bool wait=false, void *data=NULL) override;
+        // Step clock domain clock_id by exactly count cycles (proxy-internal, not part of the public
+        // Gvsoc embedding API). Async only; the proxy always uses async.
+        void step_cycles(int clock_id, int64_t count, bool wait=false, void *data=NULL);
         void step_until(int64_t timestamp, bool wait=false, void *data=NULL) override;
         int join() override;
         void lock() override;

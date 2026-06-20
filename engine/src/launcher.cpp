@@ -539,6 +539,59 @@ void gv::Controller::step_async(int64_t duration, ControllerClient *client, bool
     this->step_until_async(this->handler->get_time_engine()->get_time() + duration, client, wait, request);
 }
 
+void gv::Controller::step_cycles_async(int clock_id, int64_t count, ControllerClient *client,
+    bool wait, void *request)
+{
+    vp::ClockEngine *clock = this->handler->get_time_engine()->get_clock_engines()[clock_id];
+
+    // Carry the controller/client/request into the C-style clock callback. Freed in the handler.
+    StepCyclesReq *req = new StepCyclesReq{ this, client, request };
+
+    // Enqueue a delayed clock event at current_cycle + count in the domain itself. Its handler
+    // pauses the engine on a clean cycle boundary (end of the timestamp) and invokes our callback.
+    // Note: ClockEngine has a single step event/callback slot, so only one outstanding cycle-step
+    // per domain is supported; stepping is one-at-a-time (the client blocks on the reply).
+    clock->step_cycles(count, &Controller::step_cycles_async_handler, (void *)req);
+
+    this->client_run(client);
+
+    if (wait)
+    {
+        // Block until the handler stops the client (step reached) or the sim ended.
+        while (client->running && !this->is_sim_finished)
+        {
+            pthread_cond_wait(&this->cond, &this->mutex);
+        }
+    }
+}
+
+void gv::Controller::step_cycles_async_handler(void *arg)
+{
+    StepCyclesReq *req = (StepCyclesReq *)arg;
+    Controller *_this = req->controller;
+    ControllerClient *client = req->client;
+    void *request = req->request;
+    _this->logger.info("Step cycles handler\n");
+    _this->client_stop(client);
+
+    for (gv::ControllerClient *c: _this->clients)
+    {
+        if (c->user)
+        {
+            c->user->handle_step_end(request);
+        }
+    }
+
+    // Route the step-end reply to the proxy session that issued the step (same mechanism as the
+    // time-based step). No-op unless the proxy shares the host client.
+    if (_this->proxy)
+    {
+        _this->proxy->step_end(request);
+    }
+
+    delete req;
+}
+
 void gv::Controller::step_async_handler(vp::Block *__this, vp::TimeEvent *event)
 {
     Controller *_this = (Controller *)event->get_args()[0];

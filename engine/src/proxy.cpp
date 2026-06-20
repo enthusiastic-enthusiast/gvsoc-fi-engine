@@ -427,26 +427,23 @@ void gv::GvProxySession::proxy_loop()
                     int clock_idx = strtol(words[1].c_str(), NULL, 0);
                     int64_t count = strtoll(words[2].c_str(), NULL, 0);
                     auto &clocks = engine->get_clock_engines();
-                    if (clock_idx >= 0 && clock_idx < (int)clocks.size())
+                    bool can_step = clock_idx >= 0 && clock_idx < (int)clocks.size()
+                        && count > 0 && clocks[clock_idx]->get_period() > 0;
+                    if (can_step)
                     {
-                        vp::ClockEngine *clock = clocks[clock_idx];
-                        int64_t period = clock->get_period();
-                        if (period > 0)
-                        {
-                            int64_t duration = count * period;
-                            this->gvsoc->step(duration, false, (void *)atoll(req.c_str()));
-                        }
-                        else
-                        {
-                            // Period is 0 (clock not running), reply immediately
-                            std::unique_lock<std::mutex> lock(this->proxy->mutex);
-                            dprintf(reply_fd, "req=%s;msg=%ld\n", req.c_str(), engine->get_time());
-                            lock.unlock();
-                        }
+                        // Step exactly `count` cycles of the selected clock domain via a clock event
+                        // (cycle-accurate, immune to frequency changes). The reply is routed back
+                        // through GvProxy::step_end by matching this session pointer, the same
+                        // mechanism the "step" command uses. The session client is always a
+                        // ControllerClient (created by gvsoc_new in this session's constructor).
+                        this->step_req = req;
+                        static_cast<gv::ControllerClient *>(this->gvsoc)->step_cycles(
+                            clock_idx, count, false, (void *)this);
                     }
                     else
                     {
-                        // Invalid clock index, reply immediately
+                        // Invalid index, non-positive count, or a gated clock (period 0): nothing to
+                        // advance, reply immediately with the current time.
                         std::unique_lock<std::mutex> lock(this->proxy->mutex);
                         dprintf(reply_fd, "req=%s;msg=%ld\n", req.c_str(), engine->get_time());
                         lock.unlock();
