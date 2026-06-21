@@ -83,6 +83,9 @@ public:
     bool dump_next_values();
     void next_set(vp::Event *next) { this->next = next; }
     vp::Event *next_get() { return this->next; }
+    // Cycle at which the pending deferred value (dump_next / dump_highz_next)
+    // must be flushed. Used by the clock engine to arm its trace-flush event.
+    int64_t next_value_cyclestamp_get() { return this->next_value_cyclestamp; }
 
     gv::Vcd_event_type type;
     int width;
@@ -120,8 +123,11 @@ private:
     EventParseCallback parse_callback;
     void (*next_value_fill_callback)(vp::Event *event, uint8_t *value, uint8_t *flags) = NULL;
     int64_t id;
-    void *external_trace;
-    gv::Vcd_user *vcd_user;
+    // Set by enable_set(true) when streaming to a Vcd_user; stay NULL for an event that is never
+    // enabled, so enable_set(false) (called by check_event_active during init) skips the disable
+    // marker instead of dereferencing a wild pointer.
+    void *external_trace = NULL;
+    gv::Vcd_user *vcd_user = NULL;
     uint8_t *next_value;
     uint8_t *next_flags;
     vp::Event *next;
@@ -133,6 +139,12 @@ private:
     // Set on the first dump_value() so the enable replay only fires once a
     // real value has been produced (avoids replaying uninitialized storage).
     bool has_value = false;
+    // True when the current value is high-Z (released). The value storage
+    // cannot encode Z, so the enable replay needs this to re-emit Z (rather
+    // than the stale value bytes) to a late subscriber. `next_is_highz` carries
+    // it through a deferred (release_next) dump.
+    bool is_highz = false;
+    bool next_is_highz = false;
 };
 #else
 class Event {

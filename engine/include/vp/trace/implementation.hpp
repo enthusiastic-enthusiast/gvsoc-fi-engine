@@ -38,6 +38,7 @@ namespace vp {
         // Mark that a value has been produced even while inactive, so a later
         // enable can replay the owner's current value (see enable_set).
         this->has_value = true;
+        this->is_highz = false;
         EventDumpCallback callback = (EventDumpCallback)this->dump_callback;
 
         if (callback)
@@ -48,6 +49,7 @@ namespace vp {
     inline void vp::Event::dump_value(uint8_t *value, uint8_t *flags, int64_t time_delay)
     {
         this->has_value = true;
+        this->is_highz = false;
         EventDumpCallback callback = (EventDumpCallback)this->dump_callback;
 
         if (callback)
@@ -57,6 +59,11 @@ namespace vp {
     }
     inline void vp::Event::dump_highz(int64_t time_delay)
     {
+        // Record the high-Z state even while inactive, so a later enable can
+        // replay it (see enable_set) — e.g. a signal reset to high-Z before the
+        // GUI subscribes.
+        this->has_value = true;
+        this->is_highz = true;
         EventDumpCallback callback = (EventDumpCallback)this->dump_callback;
 
         if (callback)

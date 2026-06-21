@@ -43,8 +43,24 @@ class Signature:
     # string check. None means there is no legacy-string equivalent.
     tag = None
 
+    def label(self):
+        """Human-readable description of this interface, for tooling.
+
+        Used e.g. by the GUI model view to show a port's protocol next to its
+        name. Defaults to the legacy tag, falling back to the class name.
+        """
+        return self.tag or type(self).__name__
+
     def is_compatible(self, other):
-        """Return True if a master with ``self`` can bind directly to a slave with ``other``."""
+        """Return True if a master with ``self`` can bind directly to a slave with ``other``.
+
+        ``other`` is either another :class:`Signature` or a legacy signature
+        string. A string peer matches when it equals this signature's ``tag``,
+        so a class-based master binds directly to a slave still declared with
+        the historic ``signature='...'`` string (no bridge inserted).
+        """
+        if isinstance(other, str):
+            return other == self.tag
         return type(self) is type(other)
 
     def bridge_to(self, other, parent, name):
@@ -77,7 +93,13 @@ class IoV2BigPacket(Signature):
 
     tag = 'io_v2'
 
+    def label(self):
+        return 'io_v2 (big-packet)'
+
     def is_compatible(self, other):
+        # Legacy 'io_v2' string slave is the historic big-packet default.
+        if isinstance(other, str):
+            return other == self.tag
         # IoV2Sync is a tighter version of the same response surface; a
         # big-packet master is already prepared to handle the sync DONE
         # response form, so this binds directly.
@@ -126,6 +148,9 @@ class IoV2Sync(Signature):
 
     tag = 'io_v2'
 
+    def label(self):
+        return 'io_v2 (sync)'
+
     def is_compatible(self, other):
         return isinstance(other, IoV2Sync)
 
@@ -159,6 +184,9 @@ class IoV2Beat(Signature):
     def __init__(self, beat_width):
         self.beat_width = beat_width
 
+    def label(self):
+        return f'io_v2 (beat, width={self.beat_width})'
+
     def is_compatible(self, other):
         return isinstance(other, IoV2Beat) and other.beat_width == self.beat_width
 
@@ -180,3 +208,104 @@ class IoV2Beat(Signature):
         # IoV2Beat <-> IoV2Beat with differing widths is a SoC design error,
         # not a missing adapter.
         return super().bridge_to(other, parent, name)
+
+
+class Wire(Signature):
+    """Generic typed wire interface (``vp::WireMaster<T>`` / ``vp::WireSlave<T>``).
+
+    A single parametric class covering every ``wire<T>`` flavour. ``ctype`` is
+    the C++ element type as written in the model (e.g. ``'bool'``, ``'int'``,
+    ``'uint64_t'``, ``'mram_req_t*'``). Two wires are compatible only when they
+    carry the same element type.
+
+    The per-instance ``tag`` is the exact legacy string equivalent
+    (``wire<bool>``, ``wire<mram_req_t*>``, …), so a ``Wire`` master binds
+    interchangeably with a slave still declared as ``signature='wire<T>'``.
+    """
+
+    def __init__(self, ctype):
+        self.ctype = ctype
+        self.tag = f'wire<{ctype}>'
+
+    def is_compatible(self, other):
+        if isinstance(other, str):
+            return other == self.tag
+        return isinstance(other, Wire) and other.ctype == self.ctype
+
+
+class Io(Signature):
+    """Legacy IO v1 interface (``io.hpp``). Tag-equivalent to ``signature='io'``."""
+
+    tag = 'io'
+
+
+class Clock(Signature):
+    """Clock-distribution interface. Tag-equivalent to ``signature='clock'``."""
+
+    tag = 'clock'
+
+
+class ClockGen(Signature):
+    """Clock-generator control interface. Tag-equivalent to ``signature='clock_gen'``."""
+
+    tag = 'clock_gen'
+
+
+class ClockCtrl(Signature):
+    """Clock-control interface. Tag-equivalent to ``signature='clock_ctrl'``."""
+
+    tag = 'clock_ctrl'
+
+
+class Clk(Signature):
+    """Legacy clock interface (``clk.hpp``). Tag-equivalent to ``signature='clk'``."""
+
+    tag = 'clk'
+
+
+class Audio(Signature):
+    """Audio interface (``audio.hpp``). Tag-equivalent to ``signature='audio'``."""
+
+    tag = 'audio'
+
+
+class Uart(Signature):
+    """UART interface (``uart.hpp``). Tag-equivalent to ``signature='uart'``."""
+
+    tag = 'uart'
+
+
+class Cpi(Signature):
+    """Camera Parallel Interface (``cpi.hpp``). Tag-equivalent to ``signature='cpi'``."""
+
+    tag = 'cpi'
+
+
+class Hyper(Signature):
+    """HyperBus interface (``hyper.hpp``). Tag-equivalent to ``signature='hyper'``."""
+
+    tag = 'hyper'
+
+
+class I2c(Signature):
+    """I2C interface (``i2c.hpp``). Tag-equivalent to ``signature='i2c'``."""
+
+    tag = 'i2c'
+
+
+class I2s(Signature):
+    """I2S/TDM audio interface (``i2s.hpp``). Tag-equivalent to ``signature='i2s'``."""
+
+    tag = 'i2s'
+
+
+class Jtag(Signature):
+    """JTAG interface (``jtag.hpp``). Tag-equivalent to ``signature='jtag'``."""
+
+    tag = 'jtag'
+
+
+class Qspim(Signature):
+    """(Q)SPI master interface (``qspim.hpp``). Tag-equivalent to ``signature='qspim'``."""
+
+    tag = 'qspim'

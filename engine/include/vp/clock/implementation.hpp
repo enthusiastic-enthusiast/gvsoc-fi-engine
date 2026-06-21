@@ -102,14 +102,21 @@ inline void vp::ClockEngine::enqueue_trace_event(vp::Event *event)
     event->next_set(this->trace_flush_head);
     this->trace_flush_head = event;
 
-    // The clock engine might not be active in case it has no active event and the event is
-    // triggered from another clock engine
-    if (unlikely(!this->time.is_running() && !this->time.get_is_enqueued()))
+    // Make sure the engine really executes at the deferred value's cyclestamp
+    // so dump_traces() flushes it on time: arm the dummy flush event there. On
+    // a sparse clock (no permanent event) the engine would otherwise jump
+    // straight to its next delayed event — or not run at all if idle — and the
+    // deferred value (e.g. a signal release to high-Z) would be dumped late.
+    // ClockEngine::enqueue keeps the earliest cycle if already enqueued, and
+    // handles the engine being stopped or the call coming from another domain.
+    if (this->period != 0)
     {
-        if (this->period != 0 && !this->permanent_first)
+        int64_t cycles = event->next_value_cyclestamp_get() - this->get_cycles();
+        if (cycles < 1)
         {
-            time.enqueue_to_engine(this->stop_time + period);
+            cycles = 1;
         }
+        this->enqueue(&this->trace_flush_event, cycles);
     }
 }
 #endif

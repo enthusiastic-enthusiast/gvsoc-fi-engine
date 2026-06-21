@@ -32,8 +32,11 @@ namespace gv {
      * working need not bump it (bumping is always safe — it just forces a rebuild).
      *
      * v1 == trace declare/subscribe protocol (event_declare / event_subscribe).
+     * v2 == ComponentTreeNode carries TreeMapping address maps (layout change).
+     * v3 == Gvsoc::restart() added (a consumer calling it needs an engine providing it).
+     * v4 == TreeBinding carries master/slave signature labels (layout change).
      */
-    #define GV_API_VERSION 1
+    #define GV_API_VERSION 4
 
     /**
      * Return the GV_API_VERSION the engine was built with.
@@ -287,12 +290,23 @@ namespace gv {
             std::string description, std::string clock_path="") { return NULL; }
 
         /**
-         * Called by GVSOC when an event is actually enabled for streaming
-         * (regex match, explicit include_raw, or event_subscribe()).
-         * Returns the handle threaded back into event_update_*() calls.
+         * Called by GVSOC on every enable/disable transition of a streamed event (regex match,
+         * explicit include_raw, or event_subscribe()).
+         *
+         *  enabled=true : the event starts being dumped. Allocate (or look up) and return the handle
+         *      threaded back into event_update_*() calls. When timestamp > 0 the event had no data
+         *      before now, so the disabled period ending here is closed: [0, timestamp) on the
+         *      first-ever enable (the no-data lead-in), or [last-disable, timestamp) on a re-enable.
+         *  enabled=false: the event stops being dumped. Opens a disabled period at timestamp (closed
+         *      by the next enable, or left open to the end of the trace).
+         *
+         * The default implementation is a no-op returning NULL, so consumers that don't care about
+         * streaming (e.g. the VCD file dumper) are unaffected. event_declare() is separate and still
+         * used to discover the full signal set.
          */
-        virtual void *event_register(std::string path, Vcd_event_type type, int width,
-            std::string description, std::string clock_path="") { return NULL; }
+        virtual void *event_enable(std::string path, Vcd_event_type type, int width,
+            std::string description, std::string clock_path, bool enabled, int64_t timestamp)
+            { return NULL; }
 
         /**
          * Called by GVSOC to update the value of a logical VCD event.
@@ -881,6 +895,30 @@ namespace gv {
          * @returns The timestamp of the next event to be executed or -1 if there is no event.
          */
         virtual int64_t get_next_event_time() { return -1; }
+
+        /**
+         * Restart the simulated system
+         *
+         * This tears down the whole simulated system and instantiates it again from the same
+         * configuration, as if GVSOC had just been opened and started: all components are
+         * destroyed and re-created (so their state is back to power-on), time is back to 0 and
+         * the simulation is left stopped, waiting for run() to be called.
+         * The caller must have stopped the simulation first (see stop()).
+         * Bindings registered with bind() and vcd_bind() are re-applied to the new system, and
+         * trace events are declared/registered again to the VCD user with the same paths.
+         * Dynamic event subscriptions (event_subscribe) are lost and must be re-issued by the
+         * caller. Any component handle obtained with get_component(), io_bind() or wire_bind()
+         * is invalidated.
+         * Restart is refused (with an error message) on SystemC-enabled platforms (SystemC time
+         * cannot be rewound in-process) and when the proxy is enabled.
+         * Can only be called by the main controller.
+         *
+         * NOTE: declared last on purpose so that the vtable slots of the existing entries are
+         * unchanged; only this new slot is added. GV_API_VERSION is bumped accordingly so a
+         * consumer built against this header refuses to run against an engine that predates
+         * restart() (and would have no slot for it) rather than calling into a missing entry.
+         */
+        virtual void restart() {}
     };
 
 

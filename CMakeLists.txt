@@ -88,6 +88,14 @@ foreach(subdir ${GVSOC_MODULES})
     set(GAPY_TARGETS_DIR_OPT ${GAPY_TARGETS_DIR_OPT} --target-dir=${subdir})
 endforeach()
 
+# Extra modules are only visible to the config generation and to the generated
+# components, not to the modules models. This keeps the models compile commands
+# stable when extra modules are given (e.g. by testsuite builds), so that they
+# do not get recompiled and reinstalled.
+foreach(subdir ${GVSOC_EXTRA_MODULES})
+    set(GAPY_TARGETS_DIR_OPT ${GAPY_TARGETS_DIR_OPT} --target-dir=${subdir})
+endforeach()
+
 set(TARGET_CONFIG_DIR ${CMAKE_BINARY_DIR}/gvsoc/configs)
 file(MAKE_DIRECTORY ${TARGET_CONFIG_DIR})
 
@@ -109,7 +117,10 @@ if(DEFINED GVSOC_TARGETS)
 
         # Gapy is used to extract the list of components out of the specified target
 
-        if(DEFINED ENV{USE_GVRUN})
+        # Targets carrying gvrun qualifiers (attr./config.) must be generated with
+        # gvrun: gapy cannot apply those qualifiers, so the generated tree would
+        # not match the runtime systree.
+        if(DEFINED ENV{USE_GVRUN} OR target MATCHES ":(attr|config)\\.")
             set(GAPY_CMD gvrun --target=${target} ${GAPY_TARGETS_DIR_OPT}
                 --platform=gvsoc
                 --builddir=${CMAKE_CURRENT_BINARY_DIR}
@@ -216,6 +227,7 @@ foreach(component ${COMPONENTS})
     string(REPLACE " " ";" SRCS_LIST "${CONFIG_SRCS_${component}}")
     vp_model(NAME ${component}
         SOURCES "${SRCS_LIST}"
+        INCLUDES "${GVSOC_EXTRA_MODULES}"
     )
     # Link any libraries declared from the generator via Component.add_libraries().
     if(NOT "${CONFIG_LIBS_${component}}" STREQUAL "")

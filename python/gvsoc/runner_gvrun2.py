@@ -268,8 +268,10 @@ class Runner():
         # base name with ``,`` -> ``_``, ``/`` -> ``.``, ``:`` -> ``_``, then
         # collapses any remaining non-identifier characters to ``_`` for the
         # library name.
+        # The check is skipped when generating the components (build time), since the
+        # tree library of this target is not built yet at that point.
         target_name = getattr(args, 'target', None) or getattr(gapy_target, 'name', None)
-        if target_name:
+        if target_name and getattr(args, 'component_file', None) is None:
             import re
             cfg_base = (target_name
                 .replace(',', '_')
@@ -341,6 +343,17 @@ class Runner():
                 gvsoc_config_path=self.gvsoc_config_path, full_config=self.full_config)
 
         self.args = args
+
+    def _gen_legacy_sources(self, component, builddir, installdir):
+        """Invoke the legacy gen(builddir, installdir) hooks on the whole tree.
+
+        Legacy-style models like the ISS use them to emit their generated
+        sources (e.g. isa_*.cpp) when components are being generated."""
+        gen = getattr(component, 'gen', None)
+        if callable(gen):
+            gen(builddir, installdir)
+        for child in getattr(component, 'components', {}).values():
+            self._gen_legacy_sources(child, builddir, installdir)
 
     def _collect_config_classes(self, component):
         """Walk the component tree and collect unique Config classes for header generation.
@@ -455,6 +468,10 @@ class Runner():
                 raise RuntimeError('Install diretory must be specified when components are being generated')
 
             self.target.generate_all(args.builddir)
+
+            # Also invoke the legacy generation hooks, which legacy-style models
+            # like the ISS use to emit their generated sources
+            self._gen_legacy_sources(self.target, args.builddir, args.installdir)
 
             # Generate config headers and per-target tree .cpp
             self._generate_platform_tree(self.target, args.builddir, args.component_file)
@@ -616,7 +633,9 @@ class Runner():
 
                     self.full_config.set('target/gvsoc/proxy/port', port)
                     self.full_config.set('target/gvsoc/proxy/enabled', True)
-                    dump_config(self.full_config, gvrun.commands.get_abspath(args, self.gvsoc_config_path))
+                    # The current directory is already the work dir, resolving the config
+                    # path against args.work_dir again would break with a relative work dir
+                    dump_config(self.full_config, self.gvsoc_config_path)
 
                     run = pexpect.spawn(' '.join(command), encoding='utf-8', logfile=sys.stdout,
                         codec_errors='replace')
@@ -876,22 +895,48 @@ class Target(gvrun.target.Target):
             [args, otherArgs] = parser.parse_known_args()
 
         if model is None:
-            # New way of instantiating the model through gvrun
-            try:
+            # New way of instantiating the model through gvrun. The signature is taken
+            # from the callable itself so that wrappers like functools.partial resolve
+            # to the wrapped model.
+            import inspect
+            parameters = inspect.signature(self.model).parameters
+            takes_config = 'config' in parameters or any(
+                param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values())
+            if takes_config:
                 # First try with new config tree
                 self.model = self.model(parent=self, name=name, config=self.config)
-            except:
-                # Otherwise call without to kepp compatibility
+            else:
+                # Otherwise call without to keep compatibility
                 self.model = self.model(parent=self, name=name)
         else:
             # Old way through gapy
             self.model = model(parent=self, name=name, parser=parser, options=options)
+
+        self.__add_gdbserver()
 
         self.args = args
         self.parser = parser
         self.options = options
         self.rtl_cosim_runner = rtl_cosim_runner
         self.runner = None
+
+    def __add_gdbserver(self):
+        # Every target gets a gdbserver component so that --gdbserver works
+        # without per-target wiring. The component is inert unless the option
+        # enables it, registers the engine service the cores look up, and
+        # needs neither clock nor bindings. Targets may still instantiate
+        # their own (e.g. to pin default_hartid), in which case we must not
+        # add a second one: the engine service registry silently keeps only
+        # the last registered instance.
+        from gdbserver.gdbserver import Gdbserver
+
+        def has_gdbserver(component):
+            if isinstance(component, Gdbserver):
+                return True
+            return any(has_gdbserver(child) for child in component.components.values())
+
+        if isinstance(self.model, st.Component) and not has_gdbserver(self.model):
+            Gdbserver(self.model, 'gdbserver')
 
     def get_systree(self) -> SystemTreeNode | None:
         return self.model

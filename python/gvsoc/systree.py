@@ -220,6 +220,23 @@ else:
 
         def set_target_name(self, name: str) -> None: pass
 
+        def set_timing_level(self, level: str) -> None:
+            """Set the timing-accuracy level of this component's subtree."""
+            import gvrun.timing
+            gvrun.timing.check_level(level)
+            self._gv_timing_level = level
+
+        def get_timing_level(self, supported: list[str] | None=None) -> str:
+            """Resolve the timing-accuracy level applying to this component.
+
+            Same semantics as the gvrun2 ``SystemTreeNode`` method: nearest
+            node carrying a level wins, else the global ``timing`` parameter,
+            snapped to ``supported`` when given. On this legacy stack only
+            generator-set levels and the global default are available.
+            """
+            import gvrun.timing
+            return gvrun.timing.resolve_level(self, supported)
+
         def i_RESET(self) -> SlaveItf:
             return SlaveItf(self, 'reset', signature='wire<bool>')
 
@@ -1053,12 +1070,19 @@ else:
             # resolve to different clock sources, splice in the selected
             # clock-bridge component (default 'sync_only').
             _io_v2_sigs = (IoV2BigPacket, IoV2Sync, IoV2Beat)
+
+            def _is_io_v2_sig(sig):
+                # Class-based v2 signatures, plus the legacy 'io_v2' string,
+                # which is the historic big-packet default (see
+                # gvsoc.signature) and must get the same auto-crossing
+                # treatment.
+                return isinstance(sig, _io_v2_sigs) or sig == IoV2BigPacket.tag
+
             after_clock = []
             for binding in expanded:
                 master_sig = binding[6] if len(binding) > 6 else None
                 slave_sig = binding[7] if len(binding) > 7 else None
-                if not (isinstance(master_sig, _io_v2_sigs) and
-                        isinstance(slave_sig, _io_v2_sigs)):
+                if not (_is_io_v2_sig(master_sig) and _is_io_v2_sig(slave_sig)):
                     after_clock.append(binding)
                     continue
 

@@ -103,6 +103,8 @@ bool vp::Event::dump_next_values()
     if (this->next_value_cyclestamp <= this->parent.clock.get_cycles())
     {
         this->has_next_value = false;
+        this->has_value = true;
+        this->is_highz = this->next_is_highz;
         EventDumpCallback callback = (EventDumpCallback)this->dump_callback;
 
         if (callback)
@@ -370,6 +372,7 @@ uint8_t *vp::Event::parse_string(uint8_t *buffer, bool &unlock)
     return buffer + sizeof(event_string_t);
 }
 
+
 std::string vp::Event::path_get()
 {
     return this->parent.get_path() + "/" + std::string(this->name);
@@ -402,7 +405,13 @@ void vp::Event::enable_set(bool enabled, vp::Event_file *file)
         gv::Vcd_user *vcd_user = this->parent.traces.get_trace_engine()->vcd_user;
         if (vcd_user)
         {
-            this->external_trace = vcd_user->event_register(this->path_get(), this->type, this->width, this->description ? this->description : "", clock_trace_name);
+            // Register (allocate the handle) and mark the enable in one call. When enabling after
+            // time 0 the consumer closes the disabled period ending now ([0,T) on the first enable,
+            // [last-disable,T) on a re-enable), so the not-captured lead-in is blanked. Sent
+            // synchronously here, before the value replay below closes nothing further.
+            this->external_trace = vcd_user->event_enable(this->path_get(), this->type, this->width,
+                this->description ? this->description : "", clock_trace_name, true,
+                this->parent.time.get_time());
         }
         else if (file)
         {
@@ -466,14 +475,31 @@ void vp::Event::enable_set(bool enabled, vp::Event_file *file)
         // Replay the owner's current value to this freshly-enabled subscriber.
         // The value may have last been set before the subscription (e.g. a
         // clock period dumped once at reset); without this the late subscriber
-        // would see no value at all. dump_value() emits at the current time.
-        if (this->enable_value != NULL && this->has_value)
+        // would see no value at all. dump_value()/dump_highz() emit at the
+        // current time. A signal currently in high-Z (e.g. reset to high-Z
+        // before the GUI subscribed) replays Z, not its stale value bytes.
+        if (this->has_value)
         {
-            this->dump_value(this->enable_value);
+            if (this->is_highz)
+            {
+                this->dump_highz();
+            }
+            else if (this->enable_value != NULL)
+            {
+                this->dump_value(this->enable_value);
+            }
         }
     }
     else
     {
+        // Mark the event disabled: opens a disabled period at the current time so the GUI renders it
+        // as a gap instead of holding the last value. Sent directly, not through the buffered event
+        // pipeline. clock unused on disable (the DbTrace already exists).
+        if (this->vcd_user && this->external_trace)
+        {
+            this->vcd_user->event_enable(this->path_get(), this->type, this->width,
+                this->description ? this->description : "", "", false, this->parent.time.get_time());
+        }
         this->dump_callback = NULL;
     }
 }
@@ -487,6 +513,7 @@ void vp::Event::dump_highz_next()
         // (flag=1, value=1) per bit. Set both to all-1s.
         uint64_t highz = (uint64_t)-1;
         this->next_value_fill_callback(this, (uint8_t *)&highz, (uint8_t *)&highz);
+        this->next_is_highz = true;
 
         if (!this->has_next_value || cycles < this->next_value_cyclestamp)
         {
@@ -509,6 +536,7 @@ void vp::Event::dump_next(uint8_t *value, int64_t cycles, int64_t time_delay)
         uint64_t value = 0;
         uint64_t flags = 0;
         this->next_value_fill_callback(this, (uint8_t *)&value, (uint8_t *)&flags);
+        this->next_is_highz = false;
 
         if (!this->has_next_value || cycles < this->next_value_cyclestamp)
         {

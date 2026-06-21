@@ -70,6 +70,12 @@ public:
     inline void set_itf(void *itf) { this->itf = itf; }
     inline void *get_itf() { return this->remote_port->itf; }
 
+    // Remote port this port is bound to (NULL if unbound). Unlike
+    // get_remote_context(), this is valid regardless of the muxed-dispatch
+    // stubs, so it is the right way to reach the peer component (e.g. to
+    // get its clock engine).
+    inline Port *get_remote_port() { return this->remote_port; }
+
     // This is called during components instantiation
     // to a connect a master port to a slave port which can be an
     // intermediate port from a composite component.
