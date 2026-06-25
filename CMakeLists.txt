@@ -24,6 +24,22 @@ endif()
 
 project(gvsoc-core)
 
+# The ISS trace model (cpu/iss[_v2]/src/trace.cpp) resolves trace symbols via
+# libdwarf. Its headers live in a versioned subdir (libdwarf-2 on Fedora,
+# libdwarf-0 with Homebrew), and trace.cpp is compiled into several generated
+# components (gen_cpu_iss_*, gen_isa_*), so expose the include path globally
+# here rather than per-component. Linking is handled per-component via
+# Component.add_libraries(['dwarf']); components that only compile trace.cpp
+# resolve the libdwarf symbols at load time from the one that links it, exactly
+# as the previous libdw/libelf path did.
+find_package(PkgConfig QUIET)
+if(PkgConfig_FOUND)
+    pkg_check_modules(LIBDWARF QUIET libdwarf)
+    if(LIBDWARF_FOUND)
+        include_directories(${LIBDWARF_INCLUDE_DIRS})
+    endif()
+endif()
+
 # 2.2 Misc
 #
 # import_kconfig(<prefix> <kconfig_fragment> [<keys>])
