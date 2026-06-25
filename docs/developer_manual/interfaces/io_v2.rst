@@ -560,7 +560,7 @@ form the slave picked just declares its outbound binding with
 legacy-string ``'io_v2'`` slave; the master sees one normal
 ``resp()`` per beat with ``size``/``data``/``is_first``/``is_last``/
 ``burst_id``/``status`` mutated per beat. See
-`Beat-fidelity consumers`_.
+`The beat adapter`_.
 
 Write burst shapes
 ~~~~~~~~~~~~~~~~~~
@@ -693,7 +693,7 @@ declare the outbound binding with
 ``signature=IoV2Beat(beat_width=W)`` and the framework auto-inserts
 an ``IoV2BeatAdapter`` that normalises whatever response form the
 slave produced into a uniform per-beat ``resp()`` at cycle-accurate
-spacing. See `Beat-fidelity consumers`_.
+spacing. See `The beat adapter`_.
 
 Latency annotation
 ------------------
@@ -720,16 +720,62 @@ A master reusing the same request object across submissions should
 call ``req->prepare()`` (or explicitly reset ``latency``) between
 sends.
 
-Beat-fidelity consumers
------------------------
+Signatures and the adapter framework
+------------------------------------
+
+Every binding carries a **signature** on each side declaring which slice
+of the protocol that port speaks. When the two sides differ, the binding
+pass asks the *master* signature's ``bridge_to()`` to insert an adapter;
+the slave side never triggers insertion. Four signatures exist
+(``gvsoc/engine/python/gvsoc/signature.py``):
+
+.. list-table::
+   :header-rows: 1
+   :widths: 22 50 28
+
+   * - Signature
+     - Contract / when to use
+     - Bridge inserted
+   * - ``IoV2BigPacket`` (also the legacy ``'io_v2'`` string)
+     - The general case: the slave may answer in any of the three forms
+       (sync ``DONE``, async big-packet, beat stream) and the master must
+       tolerate all of them.
+     - vs a beat slave → ``IoV2BeatCollapseAdapter``
+   * - ``IoV2Sync``
+     - Strict inline sub-protocol: the slave **always** returns
+       ``IO_REQ_DONE`` and never calls ``resp()`` / ``retry()``, letting a
+       master drop all async bookkeeping. Binds **only** to another
+       ``IoV2Sync`` — anything else is a build-time error (no adapter can
+       synthesise an inline response from an async slave).
+     - none (a mismatch is a design error, raised at build)
+   * - ``IoV2SingleReq``
+     - Single-word / single-beat accesses only (the HW lint
+       ``req`` / ``gnt`` / ``r_valid`` fabric). Used by components that
+       route a response by **request identity** — functional and bandwidth
+       routers (``in_flight_map[req]``) and width/opcode splitters
+       (``req->parent``) — which therefore cannot handle a multi-beat
+       stream. Allows async + deny, never a multi-beat response.
+     - vs a beat slave → ``IoV2BeatCollapseAdapter``
+   * - ``IoV2Beat(beat_width)``
+     - Cycle-accurate consumer that wants **one** ``resp()`` per beat
+       regardless of the slave's form. ``beat_width`` must match a beat
+       peer; differing widths are a design error, not a missing adapter.
+     - vs a non-beat slave → ``IoV2BeatAdapter``
+
+The two adapters below are auto-inserted from these rules. Start with the
+beat adapter, which the cycle-accurate masters (``router_v2_beat``, the
+iDMA) rely on.
+
+The beat adapter
+~~~~~~~~~~~~~~~~~
 
 When a master wants to consume responses as a per-beat stream
 **regardless** of which of the three forms the slave chose, declare
 the outbound binding with a class-based :class:`gvsoc.signature.IoV2Beat`
 signature. The framework's binding pass auto-inserts an
 ``IoV2BeatAdapter`` between the master and the slave whenever the
-slave's signature is the legacy ``'io_v2'`` string or an explicit
-:class:`gvsoc.signature.IoV2BigPacket` — the master then sees a
+slave's signature is non-beat (``IoV2BigPacket``, ``IoV2SingleReq``,
+``IoV2Sync`` or the legacy ``'io_v2'`` string) — the master then sees a
 normal ``IoMaster``-shaped flow with one ``resp()`` per beat:
 
 .. code-block:: python
@@ -754,15 +800,6 @@ mutated on the request:
   beat-aware routers,
 - ``req->status`` — final status carried by every beat.
 
-Signature matrix and ``IoV2BeatAdapter`` insertion rule:
-
-==========================  ==================  ===============================
-master \\ slave              ``IoV2BigPacket``   ``IoV2Beat(W)``
-==========================  ==================  ===============================
-``IoV2BigPacket``            no adapter          no adapter (master tolerates beat-form responses)
-``IoV2Beat(W)``              **adapter inserted**  no adapter when widths match; error otherwise
-==========================  ==================  ===============================
-
 The adapter component is ``utils.io_v2_beat_adapter`` (source at
 ``gvsoc/core/models/utils/io_v2_beat_adapter.{hpp,cpp}``). It appears
 in the tree under the name ``{master_comp}_{master_port}_bridge``,
@@ -771,6 +808,43 @@ clones the master's clock binding onto the bridge. Existing users
 that consume their bus via this mechanism are ``router_v2_beat``
 and the iDMA's ``idma_be_axi`` — see
 :doc:`../components/ips/pulp/idma_v2` for a worked example.
+
+Two behaviours of the beat adapter are load-bearing for any master that
+uses it (both are stated as requirements and pitfalls further down):
+
+- **Request ownership.** A read burst is one request in, *N* beats out.
+  The adapter splits the read into beat-sized sub-reads it allocates and
+  frees itself, delivers each response beat as its **own** object that the
+  terminal master frees, and frees the master's original burst request on
+  the burst's last beat. The master must therefore hand the adapter a
+  **heap-allocated** request — never a pooled, embedded or borrowed object
+  — and never gets it back. Single-beat reads and writes round-trip the
+  master's own object as usual.
+- **Sub-read pacing.** The adapter issues at most **one sub-read per
+  cycle** (keeping up to ``max_sub_outstanding`` in flight). Issuing a
+  whole burst's sub-reads in a single cycle would make a *series* of
+  downstream bandwidth routers each compound their per-request wait,
+  halving throughput; one per cycle lets each router's watermark catch up.
+
+The collapse adapter
+~~~~~~~~~~~~~~~~~~~~~
+
+``IoV2BeatCollapseAdapter`` is the inverse: it makes a beat-streaming
+slave (e.g. a ``KIND_BEAT`` router) look like a plain big-packet slave to
+an ``IoV2BigPacket`` or ``IoV2SingleReq`` master. The binding pass inserts
+it whenever such a master binds a beat slave — so a *functional* router
+that routes by request identity never sees a raw beat stream it cannot
+handle. Source: ``gvsoc/core/models/utils/io_v2_beat_collapse_adapter.cpp``.
+
+It keeps the classic round-trip on the master side (the master owns its
+request; the adapter hands that exact object back on completion) and uses
+new/delete on the beat side (it allocates a fresh downstream request whose
+data pointer aliases the master's buffer, consumes and frees the *N*
+response beats, then returns the master's own request as one big-packet
+reply on the last beat). It is **single-outstanding**: a second master
+access while one is in flight is ``DENIED`` and retried — so only place it
+behind a single-outstanding master (an in-order core, a single-refill
+i-cache).
 
 Generic mechanism
 ~~~~~~~~~~~~~~~~~
@@ -852,17 +926,95 @@ The two protocols are wire-incompatible — a v1 master can't bind
 to a v2 slave or vice-versa — but a single simulation can include
 both as long as ports only bind same-version-to-same-version.
 
+Model requirements
+------------------
+
+The hard contracts a model must honour to be correct on a v2 path. Each is
+backed by code referenced in *See also*.
+
+1. **Tolerate every response form your signature admits.** An
+   ``IoV2BigPacket`` master must handle all three forms (sync ``DONE``,
+   async big-packet, beat stream). Narrow the signature
+   (``IoV2Sync`` / ``IoV2SingleReq`` / ``IoV2Beat``) to legitimately
+   restrict what you must handle — don't assume a form.
+2. **Hand the beat adapter a heap-allocated request for multi-beat
+   reads.** The adapter owns it and frees it on the last beat; a pooled,
+   embedded or stack object is a use-after-free / double-free. The
+   consuming side frees what it is given.
+3. **Re-send a ``DENIED`` request synchronously inside ``retry()``** — same
+   cycle, before the callback returns. Deferring it to a later cycle
+   live-locks slaves (e.g. ``log_ico_v2``) whose accept window is only open
+   during the call.
+4. **Tolerate per-beat address mutation.** A slave may leave ``addr`` at
+   the burst base or advance it to ``burst_addr + emitted``; masters must
+   accept either.
+5. **Free the response beats you receive.** For a multi-beat read the
+   terminal master frees each adapter-allocated beat; single-beat and write
+   responses arrive on your own round-tripped object.
+6. **Choose the signature deliberately.** ``IoV2Sync`` for inline-only
+   slaves; ``IoV2SingleReq`` for single-word, identity-routed routers and
+   splitters; ``IoV2Beat`` for cycle-accurate per-beat consumers;
+   ``IoV2BigPacket`` for the general case.
+7. **Beat routers: preserve the master's ``is_last`` and size the burst
+   budget.** A downstream beat adapter overwrites ``req->is_last`` per beat,
+   so snapshot the master's value at forward time. Pick a shared
+   ``max_pending_bursts`` pool or a per-input
+   ``max_pending_bursts_per_input`` budget to match the modelled hardware.
+
+Pitfalls and lessons learned
+----------------------------
+
+Real bugs hit while building the beat path, and the rule each produced.
+These are the cheapest mistakes to repeat, so they are called out
+explicitly.
+
+- **Pooled-object double-free.** A DMA issued reads on a request object
+  embedded in a pooled vector; the beat adapter ``delete``\d it on the last
+  beat, corrupting the heap (the crash surfaced only at teardown). *Rule:
+  heap-allocate any request handed to the adapter; the consuming side
+  frees it* (requirement 2).
+- **Clock-bridge aliasing.** Reusing one request object across the *N*
+  beats of a read response let a *deferring* downstream (a frequency-
+  crossing clock bridge that queues the response) alias and lose beats.
+  *Rule: a multi-beat read delivers a distinct object per non-terminal
+  beat; only single-beat / terminal responses round-trip one object.*
+- **Series-router 2× latency.** Issuing all of a burst's sub-reads in one
+  cycle made two series bandwidth routers each charge their per-request
+  bandwidth wait, so a path that should stream at 8 B/cyc streamed at 4.
+  *Rule: pace sub-read issuance to one per cycle and size the outstanding
+  window ≥ the downstream round-trip* (the adapter does this).
+- **Sync-retry deadlock.** A master that re-sent its denied request on the
+  cycle *after* ``retry()`` live-locked a zero-buffer arbiter. *Rule:
+  re-send inside the ``retry()`` callback* (requirement 3).
+- **Lost ``is_last`` in a beat router.** With a beat adapter downstream
+  overwriting ``req->is_last`` per response beat, the router could not tell
+  when a write burst ended. *Rule: snapshot ``is_last`` per forward
+  (``pending_master_is_last``)* (requirement 7).
+- **Shared burst pool starvation.** A single ``max_pending_bursts`` pool
+  shared across a beat router's inputs let one busy input consume every
+  slot and starve the others. *Rule: give each input its own
+  ``max_pending_bursts_per_input`` budget when modelling per-master,
+  ID-bounded AXI outstanding.*
+
 See also
 --------
 
 - The header itself: ``gvsoc/engine/engine/include/vp/itf/io_v2.hpp``
   (the burst-conventions section at the top of the file is the
   authoritative source for the on-the-wire contract).
+- The signature classes and the ``bridge_to`` insertion logic:
+  ``gvsoc/engine/python/gvsoc/signature.py``.
 - The framework-inserted beat-response adapter:
   ``gvsoc/core/models/utils/io_v2_beat_adapter.{hpp,cpp}``
   (standalone ``vp::Component`` named ``utils.io_v2_beat_adapter``;
   auto-inserted by the binding pass on any io_v2 path whose master
-  declares ``signature=IoV2Beat(...)`` and whose slave is
-  ``IoV2BigPacket`` or the legacy ``'io_v2'`` string).
+  declares ``signature=IoV2Beat(...)`` and whose slave is non-beat).
+- The inverse collapse adapter:
+  ``gvsoc/core/models/utils/io_v2_beat_collapse_adapter.{cpp,py}``
+  (inserted when an ``IoV2BigPacket`` / ``IoV2SingleReq`` master binds a
+  beat slave).
+- Real heap-alloc/free masters to copy: the cluster DMA
+  ``gvsoc/gap9/models/ips/gap/cluster/mchan_beat.cpp`` and the iDMA
+  ``gvsoc/pulp/models/pulp/ips/pulp/idma_v2/be/idma_be_axi.cpp``.
 - A worked end-to-end example using the v2 protocol with all
   three response forms: :doc:`../components/ips/pulp/idma_v2`.
