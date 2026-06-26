@@ -110,8 +110,16 @@ the bus. Fields a master or slave usually touches:
        a burst. ``-1`` means "no burst".
    * - ``latency``
      - ``int64_t``
-     - Cycle delay annotated by routers / targets that model timing
-       inline. See `Latency annotation`_.
+     - Head latency: cycle delay annotated by routers / targets that
+       model timing inline. **Additive** across series hops
+       (``inc_latency``). See `Latency annotation`_.
+   * - ``duration``
+     - ``int64_t``
+     - Bandwidth occupancy (e.g. ``ceil(size / bandwidth)``), kept
+       separate from ``latency`` because it combines with **max**, not
+       sum (``set_duration``): series resources that stream the same
+       packet overlap, so the end-to-end transfer time is the
+       bottleneck, not the total. See `Latency annotation`_.
    * - ``second_data``
      - ``uint8_t *``
      - Second operand pointer for atomics (e.g. ``SC`` /
@@ -144,7 +152,7 @@ Ownership / mutation rules:
 
 A master reusing a request between sends should call
 ``req->prepare()`` to reset per-send fields (currently
-``latency = 0`` and ``status = IO_RESP_OK``).
+``latency = 0``, ``duration = 0`` and ``status = IO_RESP_OK``).
 
 Ports
 -----
@@ -698,13 +706,32 @@ spacing. See `The beat adapter`_.
 Latency annotation
 ------------------
 
-``req->latency`` is a cycle count carrying the timing cost of the
-transaction along the path from slave to master. Components that
-model timing inline — i.e. that return ``IO_REQ_DONE`` after a
-logical delay — add cycles to it before returning. The master
-reads it and stalls its own pipeline accordingly (the
-``IoV2BeatAdapter``, for instance, spreads beats so the last
-one lands at ``now + latency``).
+The timing cost of an inline transaction is carried in **two**
+fields, combined differently along the path from slave to master:
+
+- ``req->latency`` — **head latency** (pipeline / contention delay).
+  Components add to it with ``inc_latency(n)``, so it is **additive**
+  across series hops: each hop contributes its own.
+- ``req->duration`` — **bandwidth occupancy** (the time a resource is
+  busy streaming the packet, typically ``ceil(size / bandwidth)``).
+  Components set it with ``set_duration(n)``, which keeps the **max**,
+  not the sum. Two bandwidth routers in series each occupy their link
+  for ``duration`` cycles, but those occupations *overlap* (the bytes
+  pipeline through both), so the end-to-end transfer time is the
+  bottleneck — the max — not the total.
+
+A master reads the whole transaction cost via
+``req->get_full_latency()`` (``= latency + duration``) and stalls its
+pipeline accordingly (the ``IoV2BeatAdapter``, for instance, spreads
+beats so the last one lands at ``now + get_full_latency()``).
+``duration`` defaults to 0, so a request that never traverses a
+bandwidth-limited resource has ``get_full_latency() == get_latency()``
+— consumers that read only ``get_latency()`` keep working on those
+paths, but **any consumer downstream of a bandwidth router must read
+``get_full_latency()``** or it loses the transfer time. The reference
+bandwidth model is ``router_v2_bandwidth`` (``inc_latency(head)`` +
+``set_duration(burst)``); the beat and collapse adapters consume it
+with ``get_full_latency()``.
 
 For models that already use wall-clock scheduling (a
 ``ClockEvent``-based deferred ``resp()``) the field can stay at 0
@@ -760,9 +787,11 @@ the slave side never triggers insertion. Four signatures exist
      - Cycle-accurate consumer that wants **one** ``resp()`` per beat
        regardless of the slave's form. ``beat_width`` must match a beat
        peer; differing widths are a design error, not a missing adapter.
-     - vs a non-beat slave → ``IoV2BeatAdapter``
+     - vs an ``IoV2Sync`` slave → ``IoV2BeatSyncAdapter``; vs any other
+       non-beat slave (``IoV2BigPacket`` / ``IoV2SingleReq`` / legacy) →
+       ``IoV2BeatAdapter``
 
-The two adapters below are auto-inserted from these rules. Start with the
+The three adapters below are auto-inserted from these rules. Start with the
 beat adapter, which the cycle-accurate masters (``router_v2_beat``, the
 iDMA) rely on.
 
@@ -772,11 +801,13 @@ The beat adapter
 When a master wants to consume responses as a per-beat stream
 **regardless** of which of the three forms the slave chose, declare
 the outbound binding with a class-based :class:`gvsoc.signature.IoV2Beat`
-signature. The framework's binding pass auto-inserts an
-``IoV2BeatAdapter`` between the master and the slave whenever the
-slave's signature is non-beat (``IoV2BigPacket``, ``IoV2SingleReq``,
-``IoV2Sync`` or the legacy ``'io_v2'`` string) — the master then sees a
-normal ``IoMaster``-shaped flow with one ``resp()`` per beat:
+signature. The framework's binding pass auto-inserts a beat adapter
+between the master and the slave whenever the slave's signature is
+non-beat: ``IoV2BeatSyncAdapter`` for an ``IoV2Sync`` slave (the
+specialised inline case, below) and the general ``IoV2BeatAdapter`` for
+``IoV2BigPacket`` / ``IoV2SingleReq`` / the legacy ``'io_v2'`` string.
+Either way the master sees a normal ``IoMaster``-shaped flow with one
+``resp()`` per beat:
 
 .. code-block:: python
 
@@ -825,6 +856,28 @@ uses it (both are stated as requirements and pitfalls further down):
   whole burst's sub-reads in a single cycle would make a *series* of
   downstream bandwidth routers each compound their per-request wait,
   halving throughput; one per cycle lets each router's watermark catch up.
+
+The beat-sync adapter
+~~~~~~~~~~~~~~~~~~~~~~~
+
+``IoV2BeatSyncAdapter`` is a dedicated specialisation of the beat adapter
+for an ``IoV2Sync`` slave, auto-inserted in its place for that one case.
+Because a sync slave serves *any* size inline and always replies
+``IO_REQ_DONE`` (never ``GRANTED`` / ``DENIED``), the adapter does not need
+the general adapter's per-beat sub-read pipeline at all: it **forwards the
+whole burst as a single request**, then spreads the inline response into a
+per-beat ``resp()`` stream (the same beat-spreading and ≤1-beat-per-cycle
+pacing the general adapter uses on its response side). That drops the
+sub-read FIFO, the out-of-order completion buffer, the async ``resp()``
+path and the deny/retry hold — about half the code. The externally visible
+contract is identical to the general adapter: one ``resp()`` per beat,
+``is_first`` / ``is_last`` / ``burst_id`` / ``status`` per beat, the
+last beat landing at ``now + get_full_latency()``, and the same ownership
+rules (the master hands over a **heap** burst request for a multi-beat
+read, freed on the last beat; each read beat is its own object the master
+frees). Source:
+``gvsoc/core/models/utils/io_v2_beat_sync_adapter.{hpp,cpp}``; the
+``utils/io_v2_beat_sync_adapter`` test is a standalone exerciser.
 
 The collapse adapter
 ~~~~~~~~~~~~~~~~~~~~~
@@ -982,7 +1035,12 @@ explicitly.
   cycle made two series bandwidth routers each charge their per-request
   bandwidth wait, so a path that should stream at 8 B/cyc streamed at 4.
   *Rule: pace sub-read issuance to one per cycle and size the outstanding
-  window ≥ the downstream round-trip* (the adapter does this).
+  window ≥ the downstream round-trip* (the adapter does this). The
+  complementary fix on the **big-packet** path is the ``duration`` field:
+  ``router_v2_bandwidth`` reports its bandwidth cost via ``set_duration``
+  (max-combined), so two series routers report the bottleneck transfer
+  time, not the sum. Consumers must read ``get_full_latency()``, not
+  ``get_latency()`` — otherwise they drop the bandwidth cost entirely.
 - **Sync-retry deadlock.** A master that re-sent its denied request on the
   cycle *after* ``retry()`` live-locked a zero-buffer arbiter. *Rule:
   re-send inside the ``retry()`` callback* (requirement 3).

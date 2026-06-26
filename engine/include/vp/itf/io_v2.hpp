@@ -185,8 +185,24 @@ class IoReq : public vp::QueueElem {
     void set_latency(int64_t v) { this->latency = std::max(this->latency, v); }
     void inc_latency(int64_t v) { this->latency += v; }
 
+    // Bandwidth-occupancy annotation (in cycles), kept *separate* from the head
+    // latency above. Unlike latency, duration combines with **max**, not sum:
+    // series resources that overlap (e.g. two bandwidth routers streaming the
+    // same packet) each occupy the link for `duration` cycles but those
+    // occupations pipeline, so the end-to-end transfer time is the bottleneck
+    // (the max), not the total. A component that models throughput as
+    // ceil(size / bandwidth) reports it here via set_duration().
+    //
+    // The full transaction time a master should stall by is get_full_latency()
+    // = head latency (additive) + occupancy (max). Defaults to 0, so a request
+    // that never traverses a bandwidth-limited resource has get_full_latency()
+    // == get_latency().
+    int64_t get_duration() const { return this->duration; }
+    void set_duration(int64_t v) { this->duration = std::max(this->duration, v); }
+    int64_t get_full_latency() const { return this->latency + this->duration; }
+
     // Reset per-send fields. Call before resubmitting a request object.
-    void prepare() { this->latency = 0; this->status = IO_RESP_OK; }
+    void prepare() { this->latency = 0; this->duration = 0; this->status = IO_RESP_OK; }
 
     uint64_t addr;
     uint8_t *data;
@@ -203,6 +219,7 @@ class IoReq : public vp::QueueElem {
     bool is_last = true;
     int64_t burst_id = -1;
     int64_t latency = 0;
+    int64_t duration = 0;
 
     IoReq *next;
     IoReq *parent;
