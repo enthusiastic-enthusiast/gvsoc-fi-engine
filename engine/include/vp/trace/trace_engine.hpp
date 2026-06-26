@@ -175,6 +175,24 @@ namespace vp {
         void register_master(const std::string &path) { this->masters_set.insert(path); }
         std::vector<std::string> get_masters()
         { return std::vector<std::string>(this->masters_set.begin(), this->masters_set.end()); }
+
+        // --- Master address aliases ---
+        // A master may reach the same physical memory through two address forms: a global address
+        // and a local "alias" (e.g. on gap9 the FC sees L2 both at 0x1C00_0000 and at 0x0). The alias
+        // translation happens downstream of the master, so check_access() sees whichever form the
+        // program issued. To make a watchpoint match both forms, each master's alias windows are
+        // declared (by the platform generator, via the `watchpoint_aliases` component property) and
+        // both the accessed address and the watched address are folded to canonical (global) form
+        // before matching. `master_pattern` is a substring matched against the master's path; an
+        // access in [local_base, local_base+size) by such a master maps to global_base + (addr-local).
+        struct AliasRegion { std::string master_pattern; uint64_t local_base; uint64_t global_base; uint64_t size; };
+        void register_alias(const std::string &master_pattern, uint64_t local_base,
+            uint64_t global_base, uint64_t size)
+        { this->aliases.push_back({master_pattern, local_base, global_base, size}); }
+        // Fold an address issued by `master_path` to its canonical (global) form using the declared
+        // aliases. A global address (in no local window) is returned unchanged.
+        uint64_t normalize_addr(const std::string &master_path, uint64_t addr);
+
         // Fast gate read inline by BlockTrace::declare_access: true iff at least one watchpoint set.
         bool watchpoints_active = false;
         // Most recent hit, reported to the front-end via the proxy.
@@ -244,6 +262,7 @@ namespace vp {
         std::map<std::string, Event_file *> event_files;
         std::vector<Watchpoint> watchpoints;
         std::set<std::string> masters_set;
+        std::vector<AliasRegion> aliases;
     };
 };
 

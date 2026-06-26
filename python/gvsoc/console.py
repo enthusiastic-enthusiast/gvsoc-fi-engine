@@ -1076,6 +1076,11 @@ class GvsocConsole(cmd.Cmd):
         Watchpoints apply to every master (cores, DMA, accelerators) by default; an
         'on <master>...' suffix restricts them to masters whose path contains one of
         the patterns. Stops when the watched address is written.
+
+        Address aliasing: a watchpoint matches an access whether the master used the
+        global address or its local alias (e.g. on gap9 the FC sees L2 both at
+        0x1c00_0000 and at 0x0). A global address always works; when scoped to a master
+        you may also give the master-local (alias) form.
         """
         self._add_watchpoint(arg, 'write')
 
@@ -1088,7 +1093,8 @@ class GvsocConsole(cmd.Cmd):
           rwatch *0x4000 on ne16    - only when master 'ne16' reads it
 
         Applies to every master by default; 'on <master>...' restricts it (see 'watch').
-        Stops when the watched address is read.
+        Stops when the watched address is read. Matches the access whether done through the
+        global address or a master-local alias (see 'watch' for details).
         """
         self._add_watchpoint(arg, 'read')
 

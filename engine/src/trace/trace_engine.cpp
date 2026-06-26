@@ -53,13 +53,32 @@ void vp::TraceEngine::watchpoint_remove(uint64_t addr, uint64_t size, bool is_wr
     this->watchpoints_active = !this->watchpoints.empty();
 }
 
+uint64_t vp::TraceEngine::normalize_addr(const std::string &master_path, uint64_t addr)
+{
+    for (auto &alias : this->aliases)
+    {
+        if (master_path.find(alias.master_pattern) != std::string::npos
+            && addr >= alias.local_base && addr < alias.local_base + alias.size)
+        {
+            return alias.global_base + (addr - alias.local_base);
+        }
+    }
+    return addr;
+}
+
 void vp::TraceEngine::check_access(vp::Block *master, uint64_t addr, uint64_t size, bool is_write)
 {
     std::string master_path = master->get_path();
+    // Fold the accessed address to canonical (global) form so a watchpoint matches whether the
+    // master used the global address or its local alias.
+    uint64_t access_addr = this->normalize_addr(master_path, addr);
     for (auto &wp : this->watchpoints)
     {
+        // Normalize the watched address through the same master so a watchpoint declared in either
+        // the global or the master-local form lines up with the canonical access address.
+        uint64_t wp_addr = this->normalize_addr(master_path, wp.addr);
         // Overlap test, matching the access direction (write watchpoint -> writes, read -> reads).
-        if (wp.is_write != is_write || addr >= wp.addr + wp.size || wp.addr >= addr + size)
+        if (wp.is_write != is_write || access_addr >= wp_addr + wp.size || wp_addr >= access_addr + size)
         {
             continue;
         }
@@ -82,7 +101,9 @@ void vp::TraceEngine::check_access(vp::Block *master, uint64_t addr, uint64_t si
         }
         {
             this->watchpoint_hit = true;
-            this->watchpoint_hit_addr = std::max(addr, wp.addr);
+            // Report the address as the program issued it (the form the user sees in the trace),
+            // not the canonical/normalized value used for matching.
+            this->watchpoint_hit_addr = addr;
             this->watchpoint_hit_is_write = is_write;
             this->watchpoint_hit_master = master_path;
             // Stop the whole simulation and notify proxy clients, the same way a breakpoint hit does
