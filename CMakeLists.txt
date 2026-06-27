@@ -258,6 +258,11 @@ foreach(tree_src ${TREE_SOURCES})
     set(lib_target "platform_tree_${lib_name}")
 
     add_library(${lib_target} SHARED ${tree_src})
+    # Force the ".so" suffix on all platforms (macOS would otherwise emit
+    # ".dylib"). The library is dlopen'd by explicit path from
+    # runner_gvrun2.py, which — together with the ".so.sig" sidecar below —
+    # assumes a ".so" name regardless of host.
+    set_target_properties(${lib_target} PROPERTIES SUFFIX ".so")
     target_include_directories(${lib_target} PRIVATE
         ${CMAKE_CURRENT_BINARY_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/engine/include)
