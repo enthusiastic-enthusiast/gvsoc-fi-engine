@@ -36,8 +36,9 @@ namespace gv {
      * v3 == Gvsoc::restart() added (a consumer calling it needs an engine providing it).
      * v4 == TreeBinding carries master/slave signature labels (layout change).
      * v5 == GvsocConf gains proxy_enabled (layout change).
+     * v6 == Gvsoc gains the Stdout base for the console-output channel (vtable layout change).
      */
-    #define GV_API_VERSION 5
+    #define GV_API_VERSION 6
 
     /**
      * Return the GV_API_VERSION the engine was built with.
