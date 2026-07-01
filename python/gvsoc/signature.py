@@ -249,15 +249,29 @@ class IoV2Beat(Signature):
         # Same-mode peer (IoV2Beat <-> IoV2Beat, same beat_width): no adapter.
         if self.is_compatible(other):
             return None
-        # Mismatched mode (IoV2Beat master <-> IoV2BigPacket / IoV2Sync slave,
-        # or legacy ``'io_v2'`` string slave that is by default big-packet):
-        # the adapter normalises the slave's response into a uniform per-beat
-        # stream. The legacy string is the historic v2 default and matches
-        # IoV2BigPacket semantically — the slave is free to answer in any of
-        # the three response forms, including the sync DONE that beat-fidelity
-        # masters cannot consume directly. ``IoV2Sync`` is a strict subset
-        # of that surface (DONE only), so the same adapter handles it.
-        if isinstance(other, (IoV2BigPacket, IoV2Sync, IoV2SingleReq)) or other == IoV2BigPacket.tag:
+        # IoV2Sync slave: a dedicated, simpler adapter. Because a sync slave
+        # always replies IO_REQ_DONE inline (never resp()/retry()) and serves
+        # any size in one call, the adapter forwards the whole burst as a single
+        # request and just spreads the response into per-beat resp() calls — no
+        # per-beat sub-read pipeline, no async/deny bookkeeping.
+        if isinstance(other, IoV2Sync):
+            from utils.io_v2_beat_to_sync_adapter import IoV2BeatToSyncAdapter
+            return IoV2BeatToSyncAdapter(parent, name, beat_width=self.beat_width)
+        # IoV2SingleReq slave: a dedicated, per-combination adapter. A single-req
+        # slave answers each request with a single-beat response (inline DONE,
+        # async GRANTED + one resp(), or DENIED + retry()) but never a multi-beat
+        # stream. The adapter keeps the general adapter's read sub-read pipeline
+        # and async/deny machinery, and additionally checks the single-beat
+        # response contract in asserts builds.
+        if isinstance(other, IoV2SingleReq):
+            from utils.io_v2_beat_to_single_req_adapter import IoV2BeatToSingleReqAdapter
+            return IoV2BeatToSingleReqAdapter(parent, name, beat_width=self.beat_width)
+        # Mismatched mode (IoV2Beat master <-> IoV2BigPacket slave, or legacy
+        # ``'io_v2'`` string slave that is by default big-packet): the general
+        # adapter normalises any of the slave's response forms (sync DONE, async
+        # big-packet, beat stream) into a uniform per-beat stream. The legacy
+        # string is the historic v2 default and matches IoV2BigPacket semantics.
+        if isinstance(other, IoV2BigPacket) or other == IoV2BigPacket.tag:
             from utils.io_v2_beat_adapter import IoV2BeatAdapter
             return IoV2BeatAdapter(parent, name, beat_width=self.beat_width)
         # IoV2Beat <-> IoV2Beat with differing widths is a SoC design error,

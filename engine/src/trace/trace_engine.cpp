@@ -22,16 +22,110 @@
 #include <vp/vp.hpp>
 #include <vp/itf/clk.hpp>
 #include <vp/trace/trace_engine.hpp>
+#include <vp/controller.hpp>
+#include <vp/top.hpp>
 #include <vector>
 #include <thread>
 #include <set>
+#include <algorithm>
 #include <string.h>
+
+void vp::TraceEngine::watchpoint_insert(uint64_t addr, uint64_t size, bool is_write,
+    const std::vector<std::string> &masters)
+{
+    this->watchpoints.push_back({addr, size, is_write, masters});
+    this->watchpoints_active = true;
+}
+
+void vp::TraceEngine::watchpoint_remove(uint64_t addr, uint64_t size, bool is_write)
+{
+    for (auto it = this->watchpoints.begin(); it != this->watchpoints.end(); )
+    {
+        if (it->addr == addr && it->size == size && it->is_write == is_write)
+        {
+            it = this->watchpoints.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    this->watchpoints_active = !this->watchpoints.empty();
+}
+
+uint64_t vp::TraceEngine::normalize_addr(const std::string &master_path, uint64_t addr)
+{
+    for (auto &alias : this->aliases)
+    {
+        if (master_path.find(alias.master_pattern) != std::string::npos
+            && addr >= alias.local_base && addr < alias.local_base + alias.size)
+        {
+            return alias.global_base + (addr - alias.local_base);
+        }
+    }
+    return addr;
+}
+
+void vp::TraceEngine::check_access(vp::Block *master, uint64_t addr, uint64_t size, bool is_write)
+{
+    std::string master_path = master->get_path();
+    // Fold the accessed address to canonical (global) form so a watchpoint matches whether the
+    // master used the global address or its local alias.
+    uint64_t access_addr = this->normalize_addr(master_path, addr);
+    for (auto &wp : this->watchpoints)
+    {
+        // Normalize the watched address through the same master so a watchpoint declared in either
+        // the global or the master-local form lines up with the canonical access address.
+        uint64_t wp_addr = this->normalize_addr(master_path, wp.addr);
+        // Overlap test, matching the access direction (write watchpoint -> writes, read -> reads).
+        if (wp.is_write != is_write || access_addr >= wp_addr + wp.size || wp_addr >= access_addr + size)
+        {
+            continue;
+        }
+        // Optional master filter: only hit if the master's path matches one of the patterns.
+        if (!wp.masters.empty())
+        {
+            bool match = false;
+            for (auto &pattern : wp.masters)
+            {
+                if (master_path.find(pattern) != std::string::npos)
+                {
+                    match = true;
+                    break;
+                }
+            }
+            if (!match)
+            {
+                continue;
+            }
+        }
+        {
+            this->watchpoint_hit = true;
+            // Report the address as the program issued it (the form the user sees in the trace),
+            // not the canonical/normalized value used for matching.
+            this->watchpoint_hit_addr = addr;
+            this->watchpoint_hit_is_write = is_write;
+            this->watchpoint_hit_master = master_path;
+            // Stop the whole simulation and notify proxy clients, the same way a breakpoint hit does
+            // (see iss_v2 Gdbserver::stop_for_debug). The access itself still completes, so a resume
+            // continues past it rather than re-triggering.
+            gv::Controller *launcher = this->top->get_launcher();
+            if (launcher)
+            {
+                launcher->syscall_stop_handle();
+                launcher->top_get()->get_time_engine()->pause();
+            }
+            return;
+        }
+    }
+}
 
 int64_t vp::TraceEngine::event_declare(Event *event)
 {
     this->events[event->path_get()] = event;
     this->events_array.push_back((vp::Trace *)event);
     this->is_event.push_back(true);
+    this->events_by_path[event->path_get()].push_back((int)(this->events_array.size() - 1));
     return this->events_array.size() - 1;
 }
 
@@ -145,6 +239,63 @@ int vp::TraceEngine::event_subscribe(std::string pattern, gv::Vcd::MatchKind kin
         ? this->get_event_file("all.vcd")
         : NULL;
 
+    // Bump the subscriber refcount of one events_array entry and, on the 0->1
+    // edge, wire up its streaming. Shared by the exact-match fast path and the
+    // pattern-scan path so both behave identically.
+    auto subscribe_index = [&](size_t i)
+    {
+        vp::Trace *trace = this->events_array[i];
+        if (!trace) return;
+
+        if (this->is_event[i])
+        {
+            // vp::Event entry (used by vp::Signal). Activation flips
+            // enable_set(true) on the 0->1 refcount edge.
+            vp::Event *event = (vp::Event *)trace;
+            if (event->subscriber_count++ == 0)
+            {
+                event->enable_set(true, file_dst);
+            }
+        }
+        else
+        {
+            // Legacy vp::Trace entry (vp::Register::reg_event, new_trace_event,
+            // event_imiss, pcer_*, …). Activation flips set_event_active(true)
+            // which wires dump_callback so subsequent vp::Trace::event() /
+            // event_real() / event_string() calls push values into the trace
+            // pipe. With a Vcd_user bound we also invoke event_enable on the
+            // 0->1 edge so the GUI's TraceCapturer allocates a DbTrace for the id.
+            if (trace->subscriber_count++ == 0)
+            {
+                // Allocate the streaming handle and mark the enable in one call.
+                if (this->vcd_user && trace->user_trace == NULL)
+                {
+                    this->event_enable_now(trace, true);
+                }
+                trace->set_event_active(true, file_dst);
+            }
+        }
+    };
+
+    // Fast path: an exact path is resolved with a single hash lookup instead
+    // of scanning every declared event. This is by far the dominant case (one
+    // subscribe per timeline signal), turning a timeline open from
+    // O(signals x events) into O(signals).
+    if (kind == gv::Vcd::MatchKind::Exact)
+    {
+        int count = 0;
+        auto it = this->events_by_path.find(pattern);
+        if (it != this->events_by_path.end())
+        {
+            for (int i : it->second)
+            {
+                subscribe_index(i);
+                count++;
+            }
+        }
+        return count;
+    }
+
     regex_t compiled_regex;
     bool have_regex = false;
     if (kind == gv::Vcd::MatchKind::Regex)
@@ -162,44 +313,14 @@ int vp::TraceEngine::event_subscribe(std::string pattern, gv::Vcd::MatchKind kin
         vp::Trace *trace = this->events_array[i];
         if (!trace) continue;
 
-        if (this->is_event[i])
+        const std::string &path = this->is_event[i]
+            ? ((vp::Event *)trace)->path_get()
+            : trace->get_full_path();
+
+        if (path_matches(path, pattern, kind, have_regex ? &compiled_regex : NULL))
         {
-            // vp::Event entry (used by vp::Signal). Path getter is path_get();
-            // activation flips enable_set(true) on the 0->1 refcount edge.
-            vp::Event *event = (vp::Event *)trace;
-            if (path_matches(event->path_get(), pattern, kind,
-                have_regex ? &compiled_regex : NULL))
-            {
-                if (event->subscriber_count++ == 0)
-                {
-                    event->enable_set(true, file_dst);
-                }
-                count++;
-            }
-        }
-        else
-        {
-            // Legacy vp::Trace entry (vp::Register::reg_event, new_trace_event,
-            // event_imiss, pcer_*, …). Path getter is get_full_path();
-            // activation flips set_event_active(true) which wires
-            // dump_callback so subsequent vp::Trace::event() / event_real() /
-            // event_string() calls push values into the trace pipe. With a
-            // Vcd_user bound we also invoke event_enable on the 0->1 edge
-            // so the GUI's TraceCapturer allocates a DbTrace for the id.
-            if (path_matches(trace->get_full_path(), pattern, kind,
-                have_regex ? &compiled_regex : NULL))
-            {
-                if (trace->subscriber_count++ == 0)
-                {
-                    // Allocate the streaming handle and mark the enable in one call.
-                    if (this->vcd_user && trace->user_trace == NULL)
-                    {
-                        this->event_enable_now(trace, true);
-                    }
-                    trace->set_event_active(true, file_dst);
-                }
-                count++;
-            }
+            subscribe_index(i);
+            count++;
         }
     }
 
@@ -209,6 +330,55 @@ int vp::TraceEngine::event_subscribe(std::string pattern, gv::Vcd::MatchKind kin
 
 int vp::TraceEngine::event_unsubscribe(std::string pattern, gv::Vcd::MatchKind kind)
 {
+    // Drop the subscriber refcount of one events_array entry and, on the 1->0
+    // edge, tear down its streaming. A mismatched unsubscribe (count already 0)
+    // is silently ignored to keep the counter sane. Returns whether it counted.
+    auto unsubscribe_index = [&](size_t i) -> bool
+    {
+        vp::Trace *trace = this->events_array[i];
+        if (!trace) return false;
+
+        if (this->is_event[i])
+        {
+            vp::Event *event = (vp::Event *)trace;
+            if (event->subscriber_count > 0)
+            {
+                if (--event->subscriber_count == 0)
+                {
+                    event->enable_set(false);
+                }
+                return true;
+            }
+        }
+        else
+        {
+            if (trace->subscriber_count > 0)
+            {
+                if (--trace->subscriber_count == 0)
+                {
+                    trace->set_event_active(false);
+                }
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // Fast path: exact path resolved by hash lookup (see event_subscribe).
+    if (kind == gv::Vcd::MatchKind::Exact)
+    {
+        int count = 0;
+        auto it = this->events_by_path.find(pattern);
+        if (it != this->events_by_path.end())
+        {
+            for (int i : it->second)
+            {
+                if (unsubscribe_index(i)) count++;
+            }
+        }
+        return count;
+    }
+
     regex_t compiled_regex;
     bool have_regex = false;
     if (kind == gv::Vcd::MatchKind::Regex)
@@ -226,38 +396,13 @@ int vp::TraceEngine::event_unsubscribe(std::string pattern, gv::Vcd::MatchKind k
         vp::Trace *trace = this->events_array[i];
         if (!trace) continue;
 
-        if (this->is_event[i])
+        const std::string &path = this->is_event[i]
+            ? ((vp::Event *)trace)->path_get()
+            : trace->get_full_path();
+
+        if (path_matches(path, pattern, kind, have_regex ? &compiled_regex : NULL))
         {
-            vp::Event *event = (vp::Event *)trace;
-            if (path_matches(event->path_get(), pattern, kind,
-                have_regex ? &compiled_regex : NULL))
-            {
-                // Mismatched unsubscribe (count already 0) is silently
-                // ignored — keeps the counter sane.
-                if (event->subscriber_count > 0)
-                {
-                    if (--event->subscriber_count == 0)
-                    {
-                        event->enable_set(false);
-                    }
-                    count++;
-                }
-            }
-        }
-        else
-        {
-            if (path_matches(trace->get_full_path(), pattern, kind,
-                have_regex ? &compiled_regex : NULL))
-            {
-                if (trace->subscriber_count > 0)
-                {
-                    if (--trace->subscriber_count == 0)
-                    {
-                        trace->set_event_active(false);
-                    }
-                    count++;
-                }
-            }
+            if (unsubscribe_index(i)) count++;
         }
     }
 
@@ -382,6 +527,14 @@ void vp::TraceEngine::reg_trace(vp::Trace *trace, int event, string path, string
     traces_map[full_path] = trace;
     trace->set_full_path(full_path);
     trace->is_event = event;
+
+    if (event)
+    {
+        // Legacy event trace: index its full path so exact-match subscribes
+        // resolve without a linear scan (see events_by_path). trace->id was set
+        // above to its events_array slot.
+        this->events_by_path[full_path].push_back((int)trace->id);
+    }
 
     trace->trace_file = stdout;
 

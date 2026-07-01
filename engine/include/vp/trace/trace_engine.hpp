@@ -30,6 +30,7 @@
 #include <regex.h>
 #include <queue>
 #include <unordered_map>
+#include <set>
 
 namespace vp {
 
@@ -152,10 +153,66 @@ namespace vp {
         int64_t event_declare(Event *event);
         vp::Event_file *get_event_file(std::string file);
 
+        // --- Generic memory watchpoints ---
+        // Watchpoints are declared centrally here and shared by all blocks. Any master that issues a
+        // memory access calls BlockTrace::declare_access(), which (gated by watchpoints_active)
+        // forwards to check_access() below. On a match the whole simulation is stopped and proxy
+        // clients are notified, exactly like a breakpoint hit. This makes watchpoints work for any
+        // master that declares accesses (cores, cluster DMA, accelerators), not just CPU cores.
+        // `masters` is an optional list of master-path patterns (substring match). Empty = match any
+        // master; otherwise the access only hits if its master's path contains one of the patterns.
+        struct Watchpoint { uint64_t addr; uint64_t size; bool is_write; std::vector<std::string> masters; };
+        void watchpoint_insert(uint64_t addr, uint64_t size, bool is_write,
+            const std::vector<std::string> &masters = {});
+        void watchpoint_remove(uint64_t addr, uint64_t size, bool is_write);
+        void watchpoint_clear_hit() { this->watchpoint_hit = false; }
+        // Match a declared access against the watchpoints; stop + notify on a hit. Caller has already
+        // checked watchpoints_active.
+        void check_access(vp::Block *master, uint64_t addr, uint64_t size, bool is_write);
+        // Record a master (component path) that participates in watchpoints. Called once per master
+        // (BlockTrace::declare_access registers it the first time it declares an access), so a client
+        // can list the masters a watchpoint can be scoped to. get_masters returns the sorted set.
+        void register_master(const std::string &path) { this->masters_set.insert(path); }
+        std::vector<std::string> get_masters()
+        { return std::vector<std::string>(this->masters_set.begin(), this->masters_set.end()); }
+
+        // --- Master address aliases ---
+        // A master may reach the same physical memory through two address forms: a global address
+        // and a local "alias" (e.g. on gap9 the FC sees L2 both at 0x1C00_0000 and at 0x0). The alias
+        // translation happens downstream of the master, so check_access() sees whichever form the
+        // program issued. To make a watchpoint match both forms, each master's alias windows are
+        // declared (by the platform generator, via the `watchpoint_aliases` component property) and
+        // both the accessed address and the watched address are folded to canonical (global) form
+        // before matching. `master_pattern` is a substring matched against the master's path; an
+        // access in [local_base, local_base+size) by such a master maps to global_base + (addr-local).
+        struct AliasRegion { std::string master_pattern; uint64_t local_base; uint64_t global_base; uint64_t size; };
+        void register_alias(const std::string &master_pattern, uint64_t local_base,
+            uint64_t global_base, uint64_t size)
+        { this->aliases.push_back({master_pattern, local_base, global_base, size}); }
+        // Fold an address issued by `master_path` to its canonical (global) form using the declared
+        // aliases. A global address (in no local window) is returned unchanged.
+        uint64_t normalize_addr(const std::string &master_path, uint64_t addr);
+
+        // Fast gate read inline by BlockTrace::declare_access: true iff at least one watchpoint set.
+        bool watchpoints_active = false;
+        // Most recent hit, reported to the front-end via the proxy.
+        bool watchpoint_hit = false;
+        uint64_t watchpoint_hit_addr = 0;
+        bool watchpoint_hit_is_write = false;
+        std::string watchpoint_hit_master;
+
     protected:
         std::map<std::string, Trace *> traces_map;
         std::vector<Trace *> traces_array;
         std::vector<Trace *> events_array;
+        // Path -> indices into events_array, populated at registration time.
+        // Lets event_subscribe()/event_unsubscribe() resolve an exact-match
+        // pattern with a single hash lookup instead of scanning every declared
+        // event. A vector is kept (not a single index) so the rare case of a
+        // path shared by several event entries still subscribes them all,
+        // matching the linear-scan semantics. events_array is append-only, so
+        // these indices stay valid for the engine's lifetime.
+        std::unordered_map<std::string, std::vector<int>> events_by_path;
         std::vector<bool> is_event;
         std::vector<bool> active_warnings;
         int trace_format;
@@ -203,6 +260,9 @@ namespace vp {
         bool memcheck_enabled;
         std::unordered_map<const char *, const char *> strings;
         std::map<std::string, Event_file *> event_files;
+        std::vector<Watchpoint> watchpoints;
+        std::set<std::string> masters_set;
+        std::vector<AliasRegion> aliases;
     };
 };
 

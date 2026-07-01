@@ -117,10 +117,12 @@ if(DEFINED GVSOC_TARGETS)
 
         # Gapy is used to extract the list of components out of the specified target
 
-        # Targets carrying gvrun qualifiers (attr./config.) must be generated with
-        # gvrun: gapy cannot apply those qualifiers, so the generated tree would
-        # not match the runtime systree.
-        if(DEFINED ENV{USE_GVRUN} OR target MATCHES ":(attr|config)\\.")
+        # Targets carrying gvrun qualifiers (attr./config./timing) must be
+        # generated with gvrun: gapy cannot apply those qualifiers (in particular
+        # the global ``timing=<level>`` parameter, which only reaches gvrun's
+        # parameter registry), so the generated tree would not match the runtime
+        # systree. Matches ":attr.", ":config.", ":timing." and ":timing=".
+        if(DEFINED ENV{USE_GVRUN} OR target MATCHES ":(attr|config|timing)[.=]")
             set(GAPY_CMD gvrun --target=${target} ${GAPY_TARGETS_DIR_OPT}
                 --platform=gvsoc
                 --builddir=${CMAKE_CURRENT_BINARY_DIR}
@@ -258,6 +260,11 @@ foreach(tree_src ${TREE_SOURCES})
     set(lib_target "platform_tree_${lib_name}")
 
     add_library(${lib_target} SHARED ${tree_src})
+    # Force the ".so" suffix on all platforms (macOS would otherwise emit
+    # ".dylib"). The library is dlopen'd by explicit path from
+    # runner_gvrun2.py, which — together with the ".so.sig" sidecar below —
+    # assumes a ".so" name regardless of host.
+    set_target_properties(${lib_target} PROPERTIES SUFFIX ".so")
     target_include_directories(${lib_target} PRIVATE
         ${CMAKE_CURRENT_BINARY_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/engine/include)
